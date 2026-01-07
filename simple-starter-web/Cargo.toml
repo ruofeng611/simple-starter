@@ -1,0 +1,14 @@
+[package]
+name = "simple-starter-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+simple-starter-core = { path = "../simple-starter-core" }
+serde = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+inventory = { workspace = true }
+serde_json = { workspace = true }
