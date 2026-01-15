@@ -125,7 +125,7 @@ pub(crate) fn auto_component_macro(args: TokenStream, input: TokenStream) -> Tok
 
     // Step 7: 生成扩展代码：
     //   - 保留原始函数
-    //   - 使用 无捕获闭包 直接构造组件实例并包装为 Arc<RwLock<T>>
+    //   - 使用 无捕获闭包 直接构造组件实例并包装为 Arc<T>
     //   - 通过 `submit!` 宏注册到全局组件工厂表
     let expanded = quote! {
         // 保留用户定义的原始函数（必须存在，供闭包调用）
@@ -138,12 +138,10 @@ pub(crate) fn auto_component_macro(args: TokenStream, input: TokenStream) -> Tok
                 // 存储组件的具体类型 ID，用于运行时类型匹配
                 type_id: ::std::any::TypeId::of::<#return_path>(),
                 // 构造器：无捕获闭包，等价于函数指针
-                // 调用原函数，将其返回值包装为 Arc<RwLock<T>>，
+                // 调用原函数，将其返回值包装为 Arc<T>，
                 // 并转换为 dyn Any 以便统一存储和管理
                 constructor: || {
-                    ::std::sync::Arc::new(
-                        ::std::sync::RwLock::new(#fn_name())
-                    )
+                    ::std::sync::Arc::new(#fn_name())
                 },
             }
         }

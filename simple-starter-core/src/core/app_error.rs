@@ -80,13 +80,6 @@ pub enum AppCoreError {
         source: serde_json::Error,
     },
 
-    /// 获取组件仓库写锁失败。
-    ///
-    /// **触发场景**：在多线程环境下，尝试注册组件时无法获取 `COMPONENT_REPOSITORY` 的写锁。
-    /// 通常由死锁或长时间持有读锁导致。
-    #[error("Failed to acquire write lock on COMPONENT_REPOSITORY")]
-    ComponentRepoWriteLockFailed,
-
     /// 尝试注册已存在的组件（类型 + 名称组合重复）。
     ///
     /// **触发场景**：两次调用 `register_component_with_name::<T>("name")` 使用相同类型和名称。
@@ -96,13 +89,6 @@ pub enum AppCoreError {
     /// - `name`: 注册时使用的组件名称
     #[error("Component with type {type_id:?} and name '{name}' already registered")]
     ComponentAlreadyRegistered { type_id: TypeId, name: String },
-
-    /// 获取组件仓库读锁失败。
-    ///
-    /// **触发场景**：在获取或列举组件时，无法获取 `COMPONENT_REPOSITORY` 的读锁。
-    /// 可能由写锁长时间占用引起。
-    #[error("Failed to acquire read lock on component repository")]
-    ComponentRepoReadLockFailed,
 
     /// 请求的组件未找到。
     ///
@@ -122,13 +108,13 @@ pub enum AppCoreError {
     /// **字段说明**：
     /// - `name`: 组件名称
     /// - `expected_type`: 期望的 `TypeId`
-    #[error("Type cast failed for component '{name}' - expected type {expected_type:?}")]
+    #[error("Type cast failed for component '{name}'. Actual type does not match requested type {expected_type:?}. Please check if the generic type parameter T in get_component<T> matches the registered type.")]
     ComponentTypeCastFailed { name: String, expected_type: TypeId },
 
     /// 组件类型转换失败（按类型列举时）。
     ///
     /// **触发场景**：在 `get_components_by_type::<T>()` 中，某个匹配 `TypeId` 的组件
-    /// 无法 downcast 为 `RwLock<T>`，表明内部存储不一致（理论上不应发生）。
+    /// 无法 downcast 为 `<T>`，表明内部存储不一致（理论上不应发生）。
     ///
     /// **字段说明**：
     /// - `key`: 组件键 `(TypeId, name)`

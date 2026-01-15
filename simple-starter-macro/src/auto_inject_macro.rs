@@ -137,7 +137,7 @@ pub(crate) fn auto_inject_macro(args: TokenStream, input: TokenStream) -> TokenS
         let method_name_str = format!("get_{}s", to_snake_case(&type_ident.to_string())); // 复数
         let method_name = Ident::new(&method_name_str, type_ident.span());
         methods.push(quote! {
-            pub fn #method_name(&self) -> ::std::vec::Vec<::std::sync::Arc<::std::sync::RwLock<#ty>>> {
+            pub fn #method_name(&self) -> ::std::vec::Vec<::std::sync::Arc<#ty>> {
                 ::simple_starter_core::AppCoreUtil::get_components_by_type::<#ty>().expect("Failed to get component")
             }
         });
@@ -149,7 +149,7 @@ pub(crate) fn auto_inject_macro(args: TokenStream, input: TokenStream) -> TokenS
         let method_name_str = format!("get_{}", to_snake_case(&name_str));
         let method_name = Ident::new(&method_name_str, name_lit.span());
         methods.push(quote! {
-            pub fn #method_name(&self) -> ::std::sync::Arc<::std::sync::RwLock<#ty>> {
+            pub fn #method_name(&self) -> ::std::sync::Arc<#ty> {
                 ::simple_starter_core::AppCoreUtil::get_component_by_name::<#ty>(#name_lit).expect("Failed to get component")
             }
         });

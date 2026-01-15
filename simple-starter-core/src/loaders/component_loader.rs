@@ -34,7 +34,7 @@ pub(crate) fn auto_collect_global_component_load() -> Result<()> {
             }
         }
 
-        debug!("Component '{}' initialized...", component_factory.name);
+        debug!("Registered component: [{}]", component_factory.name)
     }
 
     Ok(())

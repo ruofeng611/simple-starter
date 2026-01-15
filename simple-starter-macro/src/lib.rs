@@ -70,9 +70,9 @@ pub fn auto_component(args: TokenStream, item: TokenStream) -> TokenStream {
 /// struct AppContext {}
 ///
 /// // 自动生成：
-/// // - get_loggers() -> Option<Vec<Arc<RwLock<Logger>>>>
-/// // - get_databases() -> Option<Vec<Arc<RwLock<Database>>>>
-/// // - get_auth_service() -> Option<Arc<RwLock<AuthService>>>
+/// // - get_loggers() -> Vec<Arc<Logger>>
+/// // - get_databases() -> Vec<Arc<Database>>
+/// // - get_auth_service() -> Arc<AuthService>
 /// ```
 #[proc_macro_attribute]
 pub fn auto_inject(args: TokenStream, item: TokenStream) -> TokenStream {

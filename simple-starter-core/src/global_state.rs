@@ -20,10 +20,13 @@ pub(crate) static GLOBAL_CONFIG: OnceLock<Value> = OnceLock::new();
 /// 用于在组件仓库中唯一标识一个组件。
 pub(crate) type ComponentKey = (TypeId, String);
 
-/// 全局组件仓库（懒加载 + 读写锁保护）
+/// 全局组件仓库（惰性初始化 + 并发安全读写）
 ///
-/// 所有通过 `#[auto_component]` 或 `AppCoreUtil::register_component` 注册的组件
-/// 都会存入此 HashMap，供后续依赖注入使用。
+/// 存储所有托管的组件实例。来源包括：
+/// 1. `#[auto_component]` 宏自动扫描注册的组件。
+/// 2. 代码中显式调用 `AppCoreUtil::register_component` 注册的组件。
+///
+/// 使用 `DashMap` 提供高并发读写能力。
 pub(crate) static COMPONENT_REPOSITORY: LazyLock<
     DashMap<ComponentKey, Arc<dyn Any + Send + Sync>>,
 > = LazyLock::new(DashMap::new);

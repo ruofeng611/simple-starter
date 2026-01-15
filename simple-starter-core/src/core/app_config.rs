@@ -18,6 +18,7 @@ pub(crate) struct CoreConfig {
     pub with_thread_id: bool,
     pub with_thread_name: bool,
     pub name: Option<String>,
+    pub log_file: Option<String>,
 }
 
 impl Default for CoreConfig {
@@ -28,6 +29,7 @@ impl Default for CoreConfig {
             with_thread_id: true,
             with_thread_name: true,
             name: None,
+            log_file: None,
         }
     }
 }

@@ -3,10 +3,13 @@
 use crate::AppCoreUtil;
 use crate::core::app_config::{AppConfig, CoreConfig};
 use anyhow::{Context, Result};
+use std::fs::OpenOptions;
 use toml::Value;
-use tracing::info;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::fmt;
+use tracing::{debug, info};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{Layer, fmt};
 
 /// 插件 trait
 ///
@@ -70,22 +73,49 @@ impl Plugin for AppBasicPlugin {
             core_config.log_level
         ))?;
 
-        // 初始化 tracing
-        tracing_subscriber::fmt()
-            .with_max_level(log_level)
+        // 构建格式器
+        let formatter = fmt::format()
+            .with_thread_ids(core_config.with_thread_id)
+            .with_thread_names(core_config.with_thread_name);
+
+        // 创建一个共享的 Registry
+        let subscriber = tracing_subscriber::registry();
+
+        // 1. stderr 输出层（始终启用）
+        let stderr_layer = fmt::layer()
             .with_writer(std::io::stderr)
-            .event_format(
-                fmt::format()
-                    .with_thread_ids(core_config.with_thread_id)
-                    .with_thread_names(core_config.with_thread_name),
-            )
-            .init();
+            .event_format(formatter.clone())
+            .with_filter(log_level);
+
+        let mut layers = vec![stderr_layer.boxed()];
+
+        // 2. 文件输出层（按需启用）
+        if let Some(log_file_path) = &core_config.log_file {
+            let file = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .append(true)
+                .open(log_file_path)
+                .with_context(|| format!("Failed to open log file: {}", log_file_path))?;
+
+            let file_layer = fmt::layer()
+                .with_writer(file)
+                .event_format(formatter)
+                .with_filter(log_level);
+
+            layers.push(file_layer.boxed());
+        }
+
+        // 组合所有层并初始化
+        subscriber.with(layers).init();
+
         info!("Tracing subsystem initialized at level: {}", log_level);
 
         // 打印 profile 信息
-        match &core_config.profile {
-            Some(profile) => info!("Configuration profile activated: '{}'", profile),
-            None => info!("No configuration profile specified, using default settings"),
+        if let Some(profile) = &core_config.profile {
+            info!("Active configuration profile: '{}'", profile);
+        } else {
+            debug!("Using default configuration (no profile activated)");
         }
 
         Ok(())

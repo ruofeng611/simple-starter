@@ -1,24 +1,49 @@
 //! # 应用主入口与生命周期管理
 //!
-//! 定义 `Application` 结构体，负责：
-//! - 插件注册与依赖排序
-//! - 配置加载
-//! - 组件自动收集
-//! - 定时任务调度
-//! - 启动钩子与优雅关闭
+//! `Application` 是整个系统的运行时核心，提供：
+//! - **插件系统**：支持依赖拓扑排序与初始化/关闭顺序控制
+//! - **配置管理**：合并插件默认配置 + 用户 `application.toml` + profile 覆盖
+//! - **组件容器**：通过 `#[auto_component]` 自动注册全局单例组件
+//! - **定时任务**：基于 `tokio-cron-scheduler` 的后台/前台调度支持
+//! - **双模式运行**：
+//!   - **服务端模式**（默认）：监听 Ctrl+C/SIGTERM，适合 CLI/Service
+//!   - **自定义主循环模式**：通过 `set_main_loop_hook` 接管控制流，适合 GUI/Web
+//!
+//! 调用 `.run()` 启动应用，执行完整的生命周期流程。
 
 use crate::core::app_job::CronJob;
 use crate::core::app_plugin::AppBasicPlugin;
+use crate::global_state::COMPONENT_REPOSITORY;
 use crate::loaders::component_loader::auto_collect_global_component_load;
 use crate::loaders::config_loader::global_config_load;
 use crate::{AppCoreUtil, Plugin};
-use anyhow::{Context, Result};
 use anyhow::anyhow;
+use anyhow::{Context, Result};
 use std::collections::{HashMap, VecDeque};
+use std::thread::JoinHandle;
 use tokio::runtime::Builder;
+use tokio::sync::oneshot;
 use tokio_cron_scheduler::{Job, JobScheduler};
 use toml::{Table, Value};
-use tracing::{error, info};
+use tracing::{debug, error, info};
+
+/// 定时任务关闭句柄信息
+pub(crate) struct CronJobShutdownHandleInfo {
+    // === 在自定义主循环模式中，后台开启定时任务情况下关闭时需要用到的句柄 ===
+    /// 发送停止信号给后台线程的通道
+    pub(crate) bg_shutdown_tx: Option<oneshot::Sender<()>>,
+    /// 后台线程句柄，用于等待线程结束
+    pub(crate) bg_thread_handle: Option<JoinHandle<()>>,
+}
+
+impl CronJobShutdownHandleInfo {
+    pub(crate) fn new() -> Self {
+        CronJobShutdownHandleInfo {
+            bg_shutdown_tx: None,
+            bg_thread_handle: None,
+        }
+    }
+}
 
 /// 应用核心结构体
 pub struct Application {
@@ -30,8 +55,10 @@ pub struct Application {
     startup_hooks: Vec<Box<dyn FnOnce()>>,
     /// 应用关闭前执行的钩子函数（FnOnce）
     shutdown_hooks: Vec<Box<dyn FnOnce()>>,
-    /// 定时任务调度器（可选）
-    scheduler: Option<JobScheduler>,
+    /// 主线程让出执行权后执行的函数
+    main_loop_hook: Option<Box<dyn FnOnce(Application)>>,
+    /// 定时任务关闭句柄信息
+    cron_job_shutdown_handle: CronJobShutdownHandleInfo,
 }
 
 impl Application {
@@ -42,7 +69,8 @@ impl Application {
             plugins: Vec::new(),
             startup_hooks: Vec::new(),
             shutdown_hooks: Vec::new(),
-            scheduler: None,
+            main_loop_hook: None,
+            cron_job_shutdown_handle: CronJobShutdownHandleInfo::new(),
         }
     }
 
@@ -87,66 +115,107 @@ impl Application {
         self
     }
 
-    /// 启动应用主流程
+    /// 设置创建主循环的钩子函数
     ///
-    /// 执行顺序：
-    /// 1. 合并插件默认配置
-    /// 2. 加载用户配置并合并
-    /// 3. 初始化基础插件
-    /// 4. 自动加载组件
-    /// 5. 按依赖拓扑排序插件
-    /// 6. 初始化所有插件
-    /// 7. 执行 startup hooks
-    /// 8. 启动定时任务 & 等待退出信号
-    /// 9. 优雅关闭所有插件
+    /// 钩子函数接收 `Application` **按值移动**（即 `self`），因此：
+    /// - 你拥有整个 `Application` 实例的所有权；
+    /// - 可以从中提取插件、执行逻辑，但之后无法再使用该 `Application`；
+    /// - 此钩子执行后，`run()` 方法将结束（不会进入默认的信号等待循环）。
+    ///
+    /// # 示例
+    /// ```rust,ignore
+    /// Application::new()
+    ///     .register_plugin(MyPlugin)
+    ///     .set_main_loop_hook(|mut app| {
+    ///         println!("Total plugins: {}", app.plugins.len());
+    ///         // 注意：app 在此之后会被 drop
+    ///     })
+    ///     .run(); // 钩子在 run() 内部被调用
+    /// ```
+    pub fn set_main_loop_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(Application) + 'static,
+    {
+        self.main_loop_hook = Some(Box::new(hook));
+        self
+    }
+
+    /// 启动应用并执行完整生命周期
+    ///
+    /// 执行流程如下：
+    /// 1. **配置阶段**：
+    ///    - 收集所有插件的默认配置
+    ///    - 加载 `application.toml` 并合并（含 profile 覆盖）
+    /// 2. **初始化阶段**：
+    ///    - 初始化 `AppBasicPlugin`（日志、配置等核心能力）
+    ///    - 自动注册 `#[auto_component]` 标记的全局组件
+    ///    - 对插件按依赖关系进行拓扑排序
+    ///    - 依次初始化所有插件（按依赖顺序）
+    ///    - 执行 `startup_hooks`
+    /// 3. **运行阶段**（二选一）：
+    ///    - **默认模式**（无 `main_loop_hook`）：
+    ///      在当前线程启动 Tokio Runtime，监听退出信号，适合服务端/CLI。
+    ///    - **自定义主循环模式**（有 `main_loop_hook`）：
+    ///      将 `Application` 所有权移交钩子函数，由用户控制主循环，适合 GUI。
+    ///    > 若存在 `CronJob`，会自动启动调度器（后台线程或当前 Runtime）。
+    /// 4. **关闭阶段**：
+    ///    - 触发退出信号（Ctrl+C / SIGTERM 或用户主动结束）
+    ///    - 执行 `shutdown_hooks`
+    ///    - 逆序调用插件的 `shutdown_hook`
+    ///    - 清理全局组件仓库
+    ///
+    /// ⚠ 注意：若配置加载或插件初始化失败，程序将直接 `exit(1)`。
     pub fn run(mut self) {
-        // Step 1: 收集所有插件的默认配置（用于合并）
+        // 收集所有插件的默认配置（用于合并）
         let plugin_default_configs = self.collect_plugin_default_configs();
 
-        // Step 2: 加载用户配置（application.toml + profile）并与默认配置合并
+        // 加载用户配置（application.toml + profile）并与默认配置合并
         if let Err(e) = global_config_load(plugin_default_configs) {
-            println!("Failed to load global configuration: {}", e);
-            // 提供配置文件的查找路径信息
-            let config_dir =
-                std::env::var("CONFIG_DIR").unwrap_or_else(|_| "./resources".to_string());
-            println!("Configuration files are searched in: {}", config_dir);
-            println!("Make sure 'application.toml' exists in the config directory");
+            eprintln!("------------------------------------------------------------");
+            eprintln!("   FATAL: Configuration Load Failed");
+            eprintln!("   Error: {}", e);
+            eprintln!("------------------------------------------------------------");
             std::process::exit(1);
         }
 
-        // Step 3: 初始化基础插件（设置日志等）
+        // 初始化基础插件（设置日志等）
         match self.basic_plugin.init() {
             Ok(_) => {
                 if self.basic_plugin.should_log_init() {
-                    info!("Basic plugin initialized successfully");
+                    debug!("Core system (BasicPlugin) initialized.");
                 }
             }
             Err(e) => {
-                panic!("Failed to init basic plugin: {}", e);
+                eprintln!(
+                    "CRITICAL: Failed to initialize basic plugin (Logging/Config). Error: {}",
+                    e
+                );
+                std::process::exit(1);
             }
         }
 
-        // Step 4: 自动收集并注册所有 #[auto_component] 标记的组件
+        // 自动收集并注册所有 #[auto_component] 标记的组件
         if let Err(e) = auto_collect_global_component_load() {
-            error!("Failed to auto-collect global components: {}", e);
             error!(
-                "This may indicate duplicate component registration or component initialization issues"
+                "Failed to auto-collect global components: {}. \
+                This usually means a component was registered twice or failed to initialize.",
+                e
             );
             std::process::exit(1);
         }
 
-        // Step 5: 按插件依赖关系进行拓扑排序
+        // 按插件依赖关系进行拓扑排序
         if let Err(e) = self.sort_plugins_by_dependency() {
             error!("Failed to sort plugins by dependency: {}", e);
             std::process::exit(1);
         }
 
-        // Step 6: 依次初始化所有插件
+        // 依次初始化所有插件
         for plugin in self.plugins.iter_mut() {
             match plugin.init() {
                 Ok(_) => {
                     if plugin.should_log_init() {
-                        info!("Plugin '{}' initialized successfully", plugin.name());
+                        info!("Plugin initialized: [{}]", plugin.name());
                     }
                 }
                 Err(e) => {
@@ -156,45 +225,69 @@ impl Application {
             }
         }
 
-        // Step 7: 执行所有启动钩子
+        // 执行所有启动钩子
         if !self.startup_hooks.is_empty() {
-            info!("Running user defined startup hooks...");
+            info!("Executing startup hooks...");
             for hook in self.startup_hooks.drain(..) {
-                hook(); // FnOnce，直接调用
-            }
-        }
-
-        // Step 8: 启动 Tokio 运行时，运行主循环（含定时任务和信号监听）
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create Tokio runtime");
-        rt.block_on(self.run_main_loop());
-
-        // Step 9: 执行用户自定义的 shutdown 钩子（在插件销毁前）
-        if !self.shutdown_hooks.is_empty() {
-            info!("Running user defined shutdown hooks...");
-            for hook in self.shutdown_hooks.drain(..) {
-                hook(); // FnOnce
-            }
-        }
-
-        // Step 9.1: 逆序执行所有插件的关闭钩子（先初始化的后关闭，符合 RAII/依赖释放原则）
-        for mut plugin in self.plugins.drain(..).rev() {
-            if let Some(hook) = plugin.shutdown_hook() {
                 hook();
-                if plugin.should_log_init() {
-                    info!("Plugin '{}' shutdown completed", plugin.name());
-                }
             }
+            info!("Startup hooks completed.");
         }
 
-        // Step 9.2: 关闭基础插件
-        if let Some(hook) = self.basic_plugin.shutdown_hook() {
-            hook();
+        // === 启动运行阶段：根据是否存在自定义主循环选择执行模式 ===
+        let has_cron_jobs = inventory::iter::<CronJob>.into_iter().next().is_some();
+        if let Some(main_loop) = self.main_loop_hook.take() {
+            // 自定义主循环模式（例如 GUI 应用）
+            info!("Running user-defined main loop...");
+            if has_cron_jobs {
+                info!(mode = "custom_main_loop", cron_jobs = true, "Starting background scheduler thread");
+                let (tx, rx) = oneshot::channel::<()>();
+                self.cron_job_shutdown_handle.bg_shutdown_tx = Some(tx);
+                // 启动后台线程
+                self.cron_job_shutdown_handle.bg_thread_handle =
+                    Some(std::thread::spawn(move || {
+                        let rt = Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("Failed to create background Tokio runtime");
+                        rt.block_on(async move {
+                            let mut scheduler = create_scheduler().await;
+                            info!("Background scheduler started.");
+                            // 等待关闭信号
+                            let _ = rx.await;
+                            info!("Background scheduler received shutdown signal.");
+                            scheduler
+                                .shutdown()
+                                .await
+                                .expect("Failed to shutdown scheduler");
+                        });
+                    }));
+            }
+            main_loop(self);
+        } else {
+            // 默认服务端模式（CLI/Service）
+            let rt = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime");
+            rt.block_on(async move {
+                let mut local_scheduler: Option<JobScheduler> = None;
+                if has_cron_jobs {
+                    local_scheduler = Some(create_scheduler().await);
+                }
+                info!("Application started. Awaiting shutdown signal (Ctrl+C / SIGTERM)...");
+                shutdown_signal().await;
+                if let Some(mut scheduler) = local_scheduler.take() {
+                    info!("Shutting down cron scheduler...");
+                    scheduler
+                        .shutdown()
+                        .await
+                        .expect("Failed to shutdown scheduler");
+                    info!("Cron scheduler shutdown completed.");
+                }
+                self.shutdown();
+            });
         }
-
-        info!("Application shutdown completed. All plugins terminated gracefully.");
     }
 
     /// 合并所有插件的默认配置
@@ -306,56 +399,58 @@ impl Application {
         Ok(())
     }
 
-    /// 主事件循环：启动定时任务 + 监听退出信号
-    async fn run_main_loop(&mut self) {
-        // 启动所有 cron job
-        self.start_cron_jobs().await;
-
-        info!("App started successfully.");
-
-        // 等待 Ctrl+C 或 SIGTERM
-        shutdown_signal().await;
-
-        // 关闭调度器（如果存在）
-        if let Some(mut scheduler) = self.scheduler.take() {
-            info!("Shutting down all jobs gracefully...");
-            scheduler
-                .shutdown()
-                .await
-                .expect("Failed to shutdown scheduler");
-            info!("All jobs terminated gracefully.");
+    /// 执行应用的优雅关闭流程
+    ///
+    /// 调用顺序：
+    /// 1. 通知后台调度器线程退出（如适用）
+    /// 2. 执行用户注册的 `shutdown_hooks`
+    /// 3. 逆序调用插件的 `shutdown_hook`（先初始化的后关闭）
+    /// 4. 关闭基础插件
+    /// 5. 清空全局组件仓库（触发组件析构）
+    ///
+    /// 此方法通常由 `run()` 在退出信号后自动调用，
+    /// 但在自定义主循环模式下，用户需自行调用 `app.shutdown()`。
+    pub fn shutdown(&mut self) {
+        // 关闭后台调度器线程（GUI/Custom Loop 模式）
+        if let Some(tx) = self.cron_job_shutdown_handle.bg_shutdown_tx.take() {
+            let _ = tx.send(()); // 发送停止信号
+            info!("Shutting down background cron scheduler...");
         }
-    }
-
-    /// 启动所有通过 `#[cron_job]` 注册的定时任务
-    async fn start_cron_jobs(&mut self) {
-        // 检查是否有任何 CronJob 被注册
-        if inventory::iter::<CronJob>.into_iter().next().is_some() {
-            let scheduler = JobScheduler::new()
-                .await
-                .expect("Failed to create scheduler");
-
-            // 遍历所有注册的 CronJob
-            for job_desc in inventory::iter::<CronJob> {
-                let name = job_desc.name;
-                let cron_expr = job_desc.cron_expr;
-                let runner = job_desc.runner;
-
-                info!("Registering cron job: {} ({})", name, cron_expr);
-
-                // 创建异步任务
-                let job = Job::new_async(cron_expr, move |_uuid, _l| runner())
-                    .expect("Invalid cron expression");
-
-                scheduler
-                    .add(job)
-                    .await
-                    .expect("Failed to add cron job to scheduler");
+        if let Some(handle) = self.cron_job_shutdown_handle.bg_thread_handle.take() {
+            if let Err(e) = handle.join() {
+                error!("Failed to join background scheduler thread: {:?}", e);
+            } else {
+                info!("Background cron scheduler stopped.");
             }
-
-            scheduler.start().await.expect("Failed to start scheduler");
-            self.scheduler = Some(scheduler);
         }
+
+        // 执行用户自定义的 shutdown 钩子（在插件销毁前）
+        if !self.shutdown_hooks.is_empty() {
+            info!("Running user-defined shutdown hooks...");
+            for hook in self.shutdown_hooks.drain(..) {
+                hook();
+            }
+        }
+
+        // 逆序执行所有插件的关闭钩子（先初始化的后关闭）
+        for mut plugin in self.plugins.drain(..).rev() {
+            if let Some(hook) = plugin.shutdown_hook() {
+                hook();
+                if plugin.should_log_init() {
+                    info!("Plugin '{}' shut down", plugin.name());
+                }
+            }
+        }
+
+        // 关闭基础插件
+        if let Some(hook) = self.basic_plugin.shutdown_hook() {
+            hook();
+        }
+
+        // 清空全局组件仓库，触发组件析构
+        COMPONENT_REPOSITORY.clear();
+
+        info!("Application shutdown completed. Bye!");
     }
 }
 
@@ -386,6 +481,33 @@ async fn shutdown_signal() {
             info!("Received SIGTERM. Initiating graceful shutdown...");
         },
     }
+}
+
+async fn create_scheduler() -> JobScheduler {
+    let scheduler = JobScheduler::new()
+        .await
+        .expect("Failed to create scheduler");
+
+    // 遍历所有注册的 CronJob
+    for job_desc in inventory::iter::<CronJob> {
+        let name = job_desc.name;
+        let cron_expr = job_desc.cron_expr;
+        let runner = job_desc.runner;
+
+        info!("Scheduling Job: [{}] schedule: '{}'", name, cron_expr);
+
+        // 创建异步任务
+        let job =
+            Job::new_async(cron_expr, move |_uuid, _l| runner()).expect("Invalid cron expression");
+
+        scheduler
+            .add(job)
+            .await
+            .expect("Failed to add cron job to scheduler");
+    }
+
+    scheduler.start().await.expect("Failed to start scheduler");
+    scheduler
 }
 
 /// 合并两个插件的默认配置（overlay 覆盖 base）

@@ -145,7 +145,7 @@ use simple_starter_web::WebPlugin;
 fn main() {
    Application::new()
            .register_plugin(WebPlugin::new())
-           .add_startup_hook(|| println!("✅ Server ready!"))
+           .add_startup_hook(|| println!("Server ready!"))
            .run();
 }
 ```
