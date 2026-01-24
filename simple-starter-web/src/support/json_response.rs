@@ -1,90 +1,55 @@
 //! 统一 JSON 响应体处理模块。
 //!
-//! 本模块定义了标准的 Web API 响应格式 `JsonResponse`，
-//! 并提供了 `json_response_wrap!` 声明宏，用于在 handler 函数内部
-//! 方便地构建此格式的响应，同时自动处理 `Result` 类型的错误。
+//! 定义了标准的 `JsonResponse` 结构，并提供了宏来简化 Controller 的编写。
 
 use crate::SimpleAppWebError;
 use serde::Serialize;
 use serde_json::Value;
 use simple_starter_core::AppCoreUtil;
-use simple_starter_core::tracing::warn;
+use simple_starter_core::tracing::error;
 
-/// 标准化的 Web API 响应体结构。
+/// 标准化 Web API 响应结构
 ///
-/// 该结构遵循常见的 REST ful API 设计规范，包含状态码、消息、服务/功能元信息以及实际数据。
+/// 遵循 { code, message, data } 的常见格式。
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JsonResponse {
-    /// 业务状态码 (例如: 200 成功, 400 参数错误, 500 服务器错误)。
+    /// 业务状态码
     pub code: i32,
-    /// 对 `code` 的人类可读描述。
+    /// 提示消息
     pub message: String,
-    /// (可选) 从全局配置 `app.name` 中获取的服务名称，用于分布式追踪。
+    /// 服务名称（用于服务标识，可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_name: Option<String>,
-    /// (可选) 调用此响应的功能名，便于调试和日志关联。
+    /// 功能名称（用于调试追踪，可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub function_name: Option<String>,
-    /// (可选) 实际的业务数据。如果序列化结果为 `null`，则不会出现在最终 JSON 中。
+    /// 实际业务数据
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
-/// `json_response_wrap!` 宏的入口。
+/// 响应封装宏 `json_response_wrap!`
 ///
-/// 此宏提供了一种声明式的方式来包装 handler 的核心逻辑，使其返回 `JsonResponse`。
-/// 它通过匹配不同的参数模式，最终都调用 `json_response_wrap_impl!` 宏来执行实际逻辑。
-///
-/// # 使用说明
-/// 在 handler 函数中，将您的核心业务逻辑（必须返回 `Result<T, SimpleAppWebError>`）
-/// 放在一个代码块 `{}` 中，并用此宏包裹。您可以根据需要传入 `code`、`message` 或 `function_name`。
-///
-/// ```ignore
-/// let resp = json_response_wrap!(
-///     code = 201,
-///     message = "Created",
-///     function_name = "create_user",
-///     {
-///         let user = create_user_in_db(...).await?;
-///         Ok(user)
-///     }
-/// );
-/// ```
+/// 用于在 Axum handler 中自动处理 `Result` 并生成 `JsonResponse`。
 #[macro_export]
 macro_rules! json_response_wrap {
     // 全参数模式: code, message, function_name
-    (code=$code:expr, message=$msg:expr, function_name=$func_name:expr, $block:block) => {{
-        $crate::json_response_wrap_impl!($code, $msg, Some($func_name), $block)
-    }};
+    (code=$code:expr, message=$msg:expr, function_name=$func_name:expr, $block:block) => {{ $crate::json_response_wrap_impl!($code, $msg, Some($func_name), $block) }};
     // 两参数模式: code, message
-    (code=$code:expr, message=$msg:expr, $block:block) => {{
-        $crate::json_response_wrap_impl!($code, $msg, None, $block)
-    }};
+    (code=$code:expr, message=$msg:expr, $block:block) => {{ $crate::json_response_wrap_impl!($code, $msg, None, $block) }};
     // 两参数模式: code, function_name
-    (code=$code:expr, function_name=$func_name:expr, $block:block) => {{
-        $crate::json_response_wrap_impl!($code, "操作成功", Some($func_name), $block)
-    }};
+    (code=$code:expr, function_name=$func_name:expr, $block:block) => {{ $crate::json_response_wrap_impl!($code, "操作成功", Some($func_name), $block) }};
     // 两参数模式: message, function_name
-    (message=$msg:expr, function_name=$func_name:expr, $block:block) => {{
-        $crate::json_response_wrap_impl!(200, $msg, Some($func_name), $block)
-    }};
+    (message=$msg:expr, function_name=$func_name:expr, $block:block) => {{ $crate::json_response_wrap_impl!(200, $msg, Some($func_name), $block) }};
     // 单参数模式: code
-    (code=$code:expr, $block:block) => {{
-        $crate::json_response_wrap_impl!($code, "操作成功", None, $block)
-    }};
+    (code=$code:expr, $block:block) => {{ $crate::json_response_wrap_impl!($code, "操作成功", None, $block) }};
     // 单参数模式: message
-    (message=$msg:expr, $block:block) => {{
-        $crate::json_response_wrap_impl!(200, $msg, None, $block)
-    }};
+    (message=$msg:expr, $block:block) => {{ $crate::json_response_wrap_impl!(200, $msg, None, $block) }};
     // 单参数模式: function_name
-    (function_name=$func_name:expr, $block:block) => {{
-        $crate::json_response_wrap_impl!(200, "操作成功", Some($func_name), $block)
-    }};
+    (function_name=$func_name:expr, $block:block) => {{ $crate::json_response_wrap_impl!(200, "操作成功", Some($func_name), $block) }};
     // 无参数模式
-    ($block:block) => {{
-        $crate::json_response_wrap_impl!(200, "操作成功", None, $block)
-    }};
+    ($block:block) => {{ $crate::json_response_wrap_impl!(200, "操作成功", None, $block) }};
 }
 
 /// `json_response_wrap!` 宏的实际实现。
@@ -101,9 +66,7 @@ macro_rules! json_response_wrap_impl {
     ($code:expr, $msg:expr, $func_name:expr, $block:block) => {{
         use $crate::SimpleAppWebError;
         use $crate::process_data;
-        // 执行用户提供的异步代码块，得到一个 Result
         let result: Result<_, SimpleAppWebError> = async move $block.await;
-        // 调用核心处理函数
         process_data($code, $msg, $func_name, result)
     }};
 }
@@ -119,7 +82,7 @@ macro_rules! json_response_wrap_impl {
 ///    - 直接使用 `err` 自身携带的 `code` 和 `message`。
 ///    - 从 `err` 中提取附加的错误数据（如果有）。
 /// 3. **通用字段**:
-///    - `service_name` 和 `function_name` 会被填充到响应中。
+///    - `service_name` 和 `function_name` (如果存在) 会被填充到响应中。
 pub fn process_data<T>(
     code: i32,
     message: &str,
@@ -129,12 +92,14 @@ pub fn process_data<T>(
 where
     T: Serialize,
 {
-    // 从全局配置中尝试获取服务名
-    let service_name = match AppCoreUtil::get_config_value_by_path("app.name") {
-        Ok(v) => v.as_str().map(|s| s.to_string()),
-        Err(_) => None,
+    // 尝试获取服务名称配置
+    let service_name: Option<String> = match AppCoreUtil::get_config_value_by_path("app.name") {
+        Some(value) => value.as_str().map(|s| s.to_string()),
+        None => None,
     };
+
     match result {
+        // 业务逻辑执行成功
         Ok(data) => JsonResponse {
             code,
             message: message.to_string(),
@@ -144,11 +109,12 @@ where
                 Ok(Value::Null) => None,
                 Ok(v) => Some(v),
                 Err(e) => {
-                    warn!("Serialize response data failed: {}", e);
+                    error!("Serialize response data failed: {:?}", e);
                     None
                 }
             },
         },
+        // 业务逻辑返回错误
         Err(err) => JsonResponse {
             code: err.code(),
             message: err.message(),

@@ -1,22 +1,17 @@
-//! # 定时任务描述结构
-//!
-//! 通过 `inventory` crate 收集所有 `CronJob` 实例，
-//! 供 `Application` 在启动时注册到调度器。
-
+use crate::core::app_types::BoxFuture;
 use inventory;
-use std::future::Future;
-use std::pin::Pin;
 
-/// 定时任务描述
-#[derive(Clone, Copy)]
+/// 定时任务结构体
+///
+/// 用于注册 Cron 表达式驱动的后台任务。
 pub struct CronJob {
-    /// 任务名称（用于日志）
+    /// 任务名称
     pub name: &'static str,
-    /// Cron 表达式（如 "0 0 * * *"）
+    /// Cron 表达式 (例如 "0 0 * * * *")
     pub cron_expr: &'static str,
-    /// 任务执行函数（返回 Future）
-    pub runner: fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
+    /// 任务执行逻辑，返回一个 BoxFuture
+    pub runner: fn() -> BoxFuture<()>,
 }
 
-// 通过 inventory 自动收集所有 CronJob 实例
+// 自动收集 CronJob
 inventory::collect!(CronJob);

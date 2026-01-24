@@ -1,18 +1,20 @@
 //! 路由工厂定义。
 //!
-//! 通过 `inventory` crate 实现编译期自动收集所有路由。
-//! 每个使用路由宏（如 `#[get(...)]`）修饰的函数会生成一个 `RouteFactory` 实例，
-//! 并在程序启动时被 `WebPlugin` 自动合并到主路由中。
+//! 利用 `inventory` crate 实现分布路由收集。
+//! 使得分散在各个模块中的 Controller 可以自动注册到主路由中，解耦了路由定义与注册逻辑。
 
 use axum::Router;
 
-/// 表示一个可延迟构建的路由单元。
+/// 路由工厂结构体
 ///
-/// - `router`: 一个无参函数，返回 `axum::Router`。
-///   该函数在插件初始化时被调用，用于构建实际路由。
+/// 包装了一个构建 `axum::Router` 的函数指针。
 pub struct RouteFactory {
+    /// 路由构建函数
+    ///
+    /// 此函数在应用启动阶段被调用，返回该模块对应的 Router 实例。
     pub router: fn() -> Router,
 }
 
-// 告诉 `inventory` crate：所有 `RouteFactory` 实例应在编译期被收集到全局静态集合中
+// 使用 inventory 宏进行收集
+// 所有通过 inventory::submit! 提交的 RouteFactory 都会被收集到全局 registry 中。
 inventory::collect!(RouteFactory);

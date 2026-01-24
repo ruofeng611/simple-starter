@@ -1,128 +1,39 @@
-//! # 插件系统接口与基础插件实现
-
-use crate::AppCoreUtil;
-use crate::core::app_config::{AppConfig, CoreConfig};
-use anyhow::{Context, Result};
-use std::fs::OpenOptions;
+use crate::application::Application;
+use async_trait::async_trait;
 use toml::Value;
-use tracing::level_filters::LevelFilter;
-use tracing::{debug, info};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{Layer, fmt};
 
-/// 插件 trait
+/// 插件 Trait
 ///
-/// 所有插件必须实现此接口。
-pub trait Plugin {
+/// 允许扩展系统功能，插件会在组件加载完毕后初始化。
+#[async_trait]
+pub trait Plugin: Send + Sync {
     /// 插件唯一名称
     fn name(&self) -> &'static str;
 
-    /// 声明依赖的其他插件名称（用于拓扑排序）
+    /// 声明依赖的其他插件名称（用于拓扑排序，确保初始化顺序）
     fn dependencies(&self) -> &[&'static str] {
         &[]
     }
 
-    /// 提供默认配置（TOML 表）
+    /// 提供插件的默认配置（将被合并到全局配置中）
     fn default_config(&self) -> Value {
         Value::Table(toml::value::Table::new())
     }
 
-    /// 初始化插件（可访问全局配置）
-    fn init(&mut self) -> Result<()>;
+    /// 初始化插件
+    ///
+    /// 在此处可以访问 `Application` 上下文，添加任务。
+    async fn init(&mut self, ctx: &mut Application) -> anyhow::Result<()>;
 
-    /// 可选的关闭钩子（应用退出时调用）
-    fn shutdown_hook(&mut self) -> Option<Box<dyn FnOnce()>> {
-        None
-    }
-
-    /// 是否在初始化成功时打印日志
-    fn should_log_init(&self) -> bool {
-        true
-    }
-}
-
-/// 基础插件：负责初始化日志系统和读取核心配置
-pub(crate) struct AppBasicPlugin;
-
-impl AppBasicPlugin {
-    pub fn new() -> Self {
-        AppBasicPlugin {}
-    }
-}
-
-impl Plugin for AppBasicPlugin {
-    fn name(&self) -> &'static str {
-        "AppBasicPlugin"
-    }
-
-    /// 提供默认核心配置
-    fn default_config(&self) -> Value {
-        let config = AppConfig::default();
-        Value::try_from(&config).unwrap()
-    }
-
-    /// 初始化 tracing 日志子系统
-    fn init(&mut self) -> Result<()> {
-        // 从配置中读取日志级别和 profile
-        let core_config: CoreConfig = AppCoreUtil::get_config_to_struct("app")
-            .context("Failed to load core configuration from 'app' section")?;
-        let log_level: LevelFilter = (&core_config.log_level).parse()
-            .with_context(|| format!(
-            "Invalid log level '{}' in configuration. Valid values are: TRACE, DEBUG, INFO, WARN, ERROR",
-            core_config.log_level
-        ))?;
-
-        // 构建格式器
-        let formatter = fmt::format()
-            .with_thread_ids(core_config.with_thread_id)
-            .with_thread_names(core_config.with_thread_name);
-
-        // 创建一个共享的 Registry
-        let subscriber = tracing_subscriber::registry();
-
-        // 1. stderr 输出层（始终启用）
-        let stderr_layer = fmt::layer()
-            .with_writer(std::io::stderr)
-            .event_format(formatter.clone())
-            .with_filter(log_level);
-
-        let mut layers = vec![stderr_layer.boxed()];
-
-        // 2. 文件输出层（按需启用）
-        if let Some(log_file_path) = &core_config.log_file {
-            let file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(true)
-                .open(log_file_path)
-                .with_context(|| format!("Failed to open log file: {}", log_file_path))?;
-
-            let file_layer = fmt::layer()
-                .with_writer(file)
-                .event_format(formatter)
-                .with_filter(log_level);
-
-            layers.push(file_layer.boxed());
-        }
-
-        // 组合所有层并初始化
-        subscriber.with(layers).init();
-
-        info!("Tracing subsystem initialized at level: {}", log_level);
-
-        // 打印 profile 信息
-        if let Some(profile) = &core_config.profile {
-            info!("Active configuration profile: '{}'", profile);
-        } else {
-            debug!("Using default configuration (no profile activated)");
-        }
-
+    /// 可选的关闭钩子
+    ///
+    /// 应用退出时，按照初始化相反的顺序调用。
+    async fn shutdown_hook(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
 
-    /// 基础插件不打印初始化成功日志（避免冗余）
-    fn should_log_init(&self) -> bool {
-        false
+    /// 是否打印标准的生命周期日志
+    fn should_log(&self) -> bool {
+        true
     }
 }

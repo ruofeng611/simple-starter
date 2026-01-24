@@ -6,19 +6,16 @@ use serde::{Deserialize, Serialize};
 
 /// Web 服务运行时配置。
 ///
-/// 支持从应用配置中加载如下字段：
-/// - `port`: 监听端口（默认 8080）
-/// - `binding`: 绑定地址（如 "0.0.0.0"）
-/// - `base_path`: 可选的全局路径前缀（如 "/api"）
-/// - `worker_thread_num`: Tokio 运行时工作线程数（可选，必须 >0）
-/// - `worker_thread_name`: 工作线程命名模板
-/// - `log_include_headers`: 是否在 trace 日志中包含 HTTP 头
+/// 对应配置文件中的 `[web]` 节点。
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct WebConfig {
+    /// 监听端口（例如 8080）
     pub port: u16,
+    /// 绑定地址（例如 "0.0.0.0" 或 "127.0.0.1"）
     pub binding: String,
+    /// 全局 API 路径前缀（例如 "/api"）。
+    /// 如果设置，所有路由都会挂载到此路径下。
     pub base_path: Option<String>,
-    pub worker_thread_num: Option<u8>,      // 注意：u8 是为了防止过大值，实际转为 usize
-    pub worker_thread_name: String,
+    /// HTTP 日志配置：是否在 Trace 日志中记录请求/响应头。
     pub log_include_headers: bool,
 }
