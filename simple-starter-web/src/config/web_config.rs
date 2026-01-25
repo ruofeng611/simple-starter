@@ -2,12 +2,12 @@
 //!
 //! 从 TOML 配置文件中解析 `web` 节点，控制服务器绑定、线程、日志等行为。
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Web 服务运行时配置。
 ///
 /// 对应配置文件中的 `[web]` 节点。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Deserialize, Debug)]
 pub(crate) struct WebConfig {
     /// 监听端口（例如 8080）
     pub port: u16,

@@ -6,7 +6,7 @@ use toml::Value;
 ///
 /// 允许扩展系统功能，插件会在组件加载完毕后初始化。
 #[async_trait]
-pub trait Plugin: Send + Sync {
+pub trait Plugin: Send {
     /// 插件唯一名称
     fn name(&self) -> &'static str;
 

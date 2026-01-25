@@ -45,11 +45,11 @@ url = "postgres://user:pass@localhost:5432/mydb"
 
 ```rust
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use simple_starter_core::{AppCoreUtil, Application, anyhow::Result};
 use simple_starter_core::tracing::info;
-use simple_starter_macro::{component, cron_job, provider, get, json_response};
+use simple_starter_core::{AppCoreUtil, Application, anyhow::Result};
+use simple_starter_macro::{component, cron_job, get, json_response, provider};
 use simple_starter_web::{JsonResponse, WebPlugin, axum, json_response_wrap};
+use std::sync::Arc;
 
 // --- 1. 定义配置结构 ---
 #[derive(Deserialize)]
@@ -77,8 +77,8 @@ impl Database {
 #[provider] // 自动推断返回类型 Database 为组件类型
 async fn db_factory() -> Database {
     // 从全局配置读取
-    let cfg: DbConfig = AppCoreUtil::get_config_to_struct("database")
-        .expect("Failed to load database config");
+    let cfg: DbConfig =
+        AppCoreUtil::get_config_to_struct("database").expect("Failed to load database config");
     info!("🔗 连接数据库: {}", cfg.url);
     Database { url: cfg.url }
 }
@@ -103,7 +103,7 @@ impl UserService {
 }
 
 // --- 5. Web 路由与控制器 ---
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct UserDto {
     id: u32,
     name: String,
@@ -120,7 +120,7 @@ async fn get_user(
     let user_service = AppCoreUtil::get_component::<UserService>().unwrap();
 
     // 使用宏统一处理响应格式 (code, msg, data)
-    json_response_wrap!(function_name="get_user", {
+    json_response_wrap!(function_name = "get_user", {
         if id == 0 {
             return Err(SimpleAppWebError::new(400, "Invalid User ID"));
         }
@@ -142,9 +142,23 @@ fn main() {
     Application::new()
         // 注册 Web 插件 (加载路由、启动 HTTP 服务)
         .register_plugin(WebPlugin::new())
-        // 添加启动钩子
         .add_startup_hook(async {
-            info!("🚀 系统启动钩子执行中...");
+            // 手动添加组件
+            let user = UserDto {
+                id: 2,
+                name: "Bob".into(),
+            };
+            AppCoreUtil::register_component(
+                user,
+                Some(move |user: UserDto| async move {
+                    info!("User destroyed: {:?}", user);
+                }),
+            )
+                .unwrap();
+        })
+        // 添加关闭钩子
+        .add_shutdown_hook(async {
+            info!("🚀 系统关闭钩子执行！！！");
         })
         // 运行应用 (阻塞主线程)
         .run();
