@@ -311,7 +311,7 @@ impl Application {
                 app_config
                     .name
                     .as_ref()
-                    .map(|s| format!("[{}] ", s))
+                    .map(|s| format!("[{}]", s))
                     .unwrap_or_default()
             );
 
