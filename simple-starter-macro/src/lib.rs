@@ -4,6 +4,7 @@ mod inject_macro;
 mod json_response_macro;
 mod provider_macro;
 mod route_macro;
+mod configuration_macro;
 
 mod utils {
     pub(crate) mod macro_build_util;
@@ -26,6 +27,14 @@ pub fn component(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn provider(args: TokenStream, item: TokenStream) -> TokenStream {
     provider_macro::provider_macro(args, item)
+}
+
+/// 定义一个配置组件
+///
+/// 该宏将结构体注册为配置组件。
+#[proc_macro_attribute]
+pub fn configuration(args: TokenStream, item: TokenStream) -> TokenStream {
+    configuration_macro::configuration_macro(args, item)
 }
 
 /// 标记依赖注入字段。

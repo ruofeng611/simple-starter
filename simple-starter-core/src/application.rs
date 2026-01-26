@@ -221,8 +221,6 @@ impl Application {
         main_loop: Box<dyn FnOnce(Application) + Send>,
         has_cron_jobs: bool,
     ) {
-        info!("Running user defined main loop...");
-
         // 如果有后台任务，启动专用线程运行它们
         if has_cron_jobs || !self.task_spawns.is_empty() {
             self.cancel_token = Some(CancellationToken::new());
@@ -279,6 +277,7 @@ impl Application {
             warn!("No background tasks or cron jobs, skipping background runtime creation.");
         }
 
+        info!("Running user defined main loop...");
         // 移交控制权给用户
         main_loop(self);
     }

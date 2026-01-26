@@ -241,11 +241,12 @@ Rust 在编译期无法反射获取所有类型。本库利用 `inventory` crate
 
 ## 📂 核心宏说明
 
-| 宏 | 作用 | 示例 |
-| :--- | :--- | :--- |
-| `#[component]` | 标记结构体为组件，纳入生命周期管理。 | `#[component(name="auth", init_method="start")]` |
-| `#[provider]` | 将函数标记为组件工厂，用于创建复杂对象。 | `#[provider] async fn create_db() -> Database` |
-| `#[inject]` | 标记字段需要注入依赖。 | `#[inject] db: Arc<Database>` |
-| `#[cron_job]` | 注册定时任务。 | `#[cron_job("0 * * * * *")]` |
-| `#[get/post...]` | 注册 HTTP 路由。 | `#[get("/user")]` |
-| `#[json_response]` | 转换返回值为 Json 格式。 | `async fn handler() -> JsonResponse` |
+| 宏                  | 作用                                  | 示例                                               |
+|:-------------------|:------------------------------------|:-------------------------------------------------|
+| `#[component]`     | 标记结构体为组件，纳入生命周期管理。                  | `#[component(name="auth", init_method="start")]` |
+| `#[provider]`      | 将函数标记为组件工厂，用于创建复杂对象。                | `#[provider] async fn create_db() -> Database`   |
+| `#[configuration]` | 将结构体标记为配置组件，从全局配置文件中读取对应路径的数据进行反序列化 | `#[configuration("constant")]`                   |
+| `#[inject]`        | 标记字段需要注入依赖。                         | `#[inject] db: Arc<Database>`                    |
+| `#[cron_job]`      | 注册定时任务。                             | `#[cron_job("0 * * * * *")]`                     |
+| `#[get/post...]`   | 注册 HTTP 路由。                         | `#[get("/user")]`                                |
+| `#[json_response]` | 转换返回值为 Json 格式。                     | `async fn handler() -> JsonResponse`             |

@@ -91,7 +91,7 @@ impl AppCoreUtil {
         // 1. 检查是否重复
         if COMPONENT_REPOSITORY.contains_key(&key) {
             return Err(ComponentError::AlreadyExists {
-                type_name: get_short_type_name::<T>(),
+                type_name: std::any::type_name::<T>().to_string(),
                 name: name_str,
             });
         }
@@ -154,19 +154,19 @@ impl AppCoreUtil {
                     Ok(inner.clone())
                 } else {
                     Err(ComponentError::NotInitialized {
-                        type_name: get_short_type_name::<T>(),
+                        type_name: std::any::type_name::<T>().to_string(),
                         name: name_str,
                     })
                 }
             } else {
                 Err(ComponentError::DowncastFailed {
-                    type_name: get_short_type_name::<T>(),
+                    type_name: std::any::type_name::<T>().to_string(),
                     name: name_str,
                 })
             }
         } else {
             Err(ComponentError::NotFound {
-                type_name: get_short_type_name::<T>(),
+                type_name: std::any::type_name::<T>().to_string(),
                 name: name_str,
             })
         }
@@ -189,13 +189,13 @@ impl AppCoreUtil {
                         results.push(inner.clone());
                     } else {
                         return Err(ComponentError::NotInitialized {
-                            type_name: get_short_type_name::<T>(),
+                            type_name: std::any::type_name::<T>().to_string(),
                             name: name.clone(),
                         });
                     }
                 } else {
                     return Err(ComponentError::DowncastFailed {
-                        type_name: get_short_type_name::<T>(),
+                        type_name: std::any::type_name::<T>().to_string(),
                         name: name.clone(),
                     });
                 }
