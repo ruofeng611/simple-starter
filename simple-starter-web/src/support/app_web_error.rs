@@ -83,27 +83,7 @@ where
     E: std::error::Error + Send + Sync + 'static,
 {
     fn from(err: E) -> Self {
-        // 1. 构建错误链字符串（用于日志）
-        let mut chain = String::new();
-        let mut current: Option<&dyn std::error::Error> = Some(&err);
-        while let Some(e) = current {
-            if !chain.is_empty() {
-                chain.push_str(" <- ");
-            }
-            chain.push_str(&e.to_string());
-            current = e.source();
-        }
-
-        // 2. 记录详细错误日志
-        // 使用 ?err (Debug) 打印原始错误结构，确保细节可见
-        error!(
-            error_type = std::any::type_name::<E>(),
-            original_error = ?err,
-            error_chain = %chain,
-            "Generic error converted to SimpleAppWebError"
-        );
-
-        // 3. 返回通用的 500 错误
+        // 默认返回通用的 500 错误，即使用"?"转换时的默认错误码和消息
         SimpleAppWebError::new(500, "服务器内部错误").with_source(err)
     }
 }

@@ -6,7 +6,7 @@ use crate::SimpleAppWebError;
 use serde::Serialize;
 use serde_json::Value;
 use simple_starter_core::AppCoreUtil;
-use simple_starter_core::tracing::error;
+use simple_starter_core::tracing::{error, warn};
 
 /// 标准化 Web API 响应结构
 ///
@@ -83,14 +83,15 @@ macro_rules! json_response_wrap_impl {
 ///    - 从 `err` 中提取附加的错误数据（如果有）。
 /// 3. **通用字段**:
 ///    - `service_name` 和 `function_name` (如果存在) 会被填充到响应中。
-pub fn process_data<T>(
+pub fn process_data<T, S>(
     code: i32,
-    message: &str,
-    function_name: Option<&str>,
+    message: S,
+    function_name: Option<S>,
     result: Result<T, SimpleAppWebError>,
 ) -> JsonResponse
 where
     T: Serialize,
+    S: Into<String>,
 {
     // 尝试获取服务名称配置
     let service_name: Option<String> = match AppCoreUtil::get_config_value_by_path("app.name") {
@@ -102,9 +103,9 @@ where
         // 业务逻辑执行成功
         Ok(data) => JsonResponse {
             code,
-            message: message.to_string(),
+            message: message.into(),
             service_name,
-            function_name: function_name.map(|s| s.to_string()),
+            function_name: function_name.map(|s| s.into()),
             data: match serde_json::to_value(data) {
                 Ok(Value::Null) => None,
                 Ok(v) => Some(v),
@@ -114,13 +115,51 @@ where
                 }
             },
         },
-        // 业务逻辑返回错误
-        Err(err) => JsonResponse {
-            code: err.code(),
-            message: err.message(),
-            service_name,
-            function_name: function_name.map(|s| s.to_string()),
-            data: err.into_error_data(),
-        },
+        Err(err) => {
+            let function_name_string = function_name.map(|s| s.into());
+            // 统一记录错误日志
+            if let Some(source) = &err.source {
+                // 构建错误链
+                let mut chain = String::new();
+                let mut current: Option<&dyn std::error::Error> = Some(source.as_ref());
+                while let Some(e) = current {
+                    if !chain.is_empty() {
+                        chain.push_str(" <- ");
+                    }
+                    chain.push_str(&e.to_string());
+                    current = e.source();
+                }
+
+                // 记录详细错误（使用 error 级别）
+                error!(
+                    error_code = err.code(),
+                    error_message = %err.message,
+                    error_type = std::any::type_name_of_val(source.as_ref()),
+                    original_error = ?source,
+                    error_chain = %chain,
+                    service_name = ?service_name,
+                    function_name = ?function_name_string,
+                    "Business logic returned an error with source"
+                );
+            } else {
+                // 没有 source，可能是业务错误（如 400），用 warn 级别
+                warn!(
+                    error_code = err.code(),
+                    error_message = %err.message,
+                    service_name = ?service_name,
+                    function_name = ?function_name_string,
+                    "Business logic returned a custom error (no source)"
+                );
+            }
+
+            // 返回 JSON 响应
+            JsonResponse {
+                code: err.code(),
+                message: err.message(),
+                service_name,
+                function_name: function_name_string,
+                data: err.into_error_data(),
+            }
+        }
     }
 }
