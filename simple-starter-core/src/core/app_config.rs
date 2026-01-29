@@ -18,16 +18,23 @@ pub(crate) struct AppConfig {
 pub(crate) struct LoggerConfig {
     /// 日志级别 (TRACE, DEBUG, INFO, WARN, ERROR)
     pub level: String,
+
+    /// 是否开启控制台输出
+    pub enable_console: bool,
+
     /// 是否在日志中显示线程 ID
     pub with_thread_id: bool,
     /// 是否在日志中显示线程名称
     pub with_thread_name: bool,
-    /// 日志文件保存路径，若为 None 则不写入文件
-    pub save_file: Option<String>,
-    /// 是否开启控制台输出
-    pub enable_console: bool,
-    /// 文件写入模式：true=追加，false=覆盖
-    pub content_append: bool,
+    /// 日志时区，默认使用UTC时间
+    pub timezone: Option<String>,
+
+    /// 日志文件路径
+    pub log_dir: Option<String>,
+    /// 日志文件名
+    pub file_name: String,
+    /// 日志文件最大数量
+    pub max_file_number: usize,
 }
 
 /// 运行时配置

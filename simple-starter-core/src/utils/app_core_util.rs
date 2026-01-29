@@ -64,7 +64,7 @@ impl AppCoreUtil {
     where
         T: Any + Send + Sync + 'static,
         F: FnOnce(T) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let name = get_short_type_name::<T>();
         Self::register_component_with_name(component, name, destroy_fn)
@@ -82,7 +82,7 @@ impl AppCoreUtil {
         T: Any + Send + Sync + 'static,
         S: Into<String>,
         F: FnOnce(T) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let name_str = name.into();
         let type_id = TypeId::of::<T>();

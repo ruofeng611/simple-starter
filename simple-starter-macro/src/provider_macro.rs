@@ -26,23 +26,28 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
     };
 
     // 2. 解析返回值类型 T
-    // Provider 函数必须返回组件实例
-    let return_type = match &func.sig.output {
+    // Provider 函数声明的完整返回类型 (例如: anyhow::Result<MyComponent>)
+    let fn_return_type = match &func.sig.output {
         ReturnType::Type(_, ty) => ty.as_ref().clone(),
         ReturnType::Default => {
             return syn::Error::new(
                 func.sig.span(),
-                "Component provider function must return a type (the component instance)",
+                "Component provider function must return a type (e.g., anyhow::Result<T>)",
             )
                 .to_compile_error()
                 .into();
         }
     };
 
-    // 确定组件名称
+    // 尝试剥离 Result<T> 获取内部的 T。
+    let component_type = get_result_inner_type(&fn_return_type)
+        .cloned()
+        .unwrap_or(fn_return_type.clone());
+
+    // 确定组件名称 (使用剥离后的类型 T)
     let final_component_name = match component_name {
         Some(n) => n,
-        None => get_short_type_name_from_type(&return_type),
+        None => get_short_type_name_from_type(&component_type),
     };
 
     // 3. 解析函数参数（处理依赖注入）
@@ -84,14 +89,14 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                     // 按名称获取
                     dependencies_names.push(name.clone());
                     arg_preparations.push(quote! {
-                        let #arg_var_name = simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name).expect("Component not found");
+                        let #arg_var_name = simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?;
                     });
                 } else {
                     // 按类型获取
                     let short_name = get_short_type_name_from_type(inner_type);
                     dependencies_names.push(short_name);
                     arg_preparations.push(quote! {
-                        let #arg_var_name = simple_starter_core::AppCoreUtil::get_component::<#inner_type>().expect("Component not found");
+                        let #arg_var_name = simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?;
                     });
                 }
 
@@ -105,13 +110,13 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
 
     // Create Fn: 包装原函数调用
     let create_fn_impl = quote! {
-        Box::new(move || -> simple_starter_core::BoxFuture<#return_type> {
+        Box::new(move || -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<#component_type>> {
             Box::pin(async move {
                 // 先准备所有参数
                 #(#arg_preparations)*
                 // 调用原 Provider 函数
-                let instance = #func_name(#(#call_args),*).await;
-                instance
+                let instance = #func_name(#(#call_args),*).await?;
+                Ok(instance)
             })
         })
     };
@@ -119,10 +124,11 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
     // Destroy Fn: 处理销毁逻辑
     let destroy_fn_impl = if let Some(expr) = destroy_method {
         quote! {
-            Some(Box::new(|c: #return_type| -> simple_starter_core::BoxFuture<()> {
+            Some(Box::new(|c: #component_type| -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<()>> {
                 Box::pin(async move {
                     // 调用用户提供的销毁表达式 (可以是函数名或闭包)
-                    let _ = (#expr)(c).await;
+                    let _ = (#expr)(c).await?;
+                    Ok(())
                 })
             }))
         }
@@ -136,9 +142,9 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
             simple_starter_core::ComponentProcessorFactory {
                 dependencies: &[#(#dependencies_names),*],
                 name: #final_component_name,
-                type_id: std::any::TypeId::of::<#return_type>(),
+                type_id: std::any::TypeId::of::<#component_type>(),
                 constructor: || {
-                    let wrapper = simple_starter_core::ComponentWrapper::<#return_type>::new(
+                    let wrapper = simple_starter_core::ComponentWrapper::<#component_type>::new(
                         #create_fn_impl,
                         None, // Provider 模式下 Init 逻辑通常包含在 create 中
                         #destroy_fn_impl
@@ -191,4 +197,26 @@ fn parse_provider_args(args: TokenStream) -> syn::Result<(Option<String>, Option
     Parser::parse2(parser, args.clone().into())?;
 
     Ok((name, destroy_method))
+}
+
+/// 辅助函数：尝试从 Result<T, E> 或 anyhow::Result<T> 中提取 T
+///
+/// 逻辑：
+/// 1. 检查是否为 Path 类型。
+/// 2. 检查最后一个段是否为 "Result"。
+/// 3. 获取尖括号内的第一个泛型参数作为类型。
+fn get_result_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Result" {
+                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
+                    // Result<T> 或 Result<T, E>，我们只需要第一个参数 T
+                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return Some(inner_ty);
+                    }
+                }
+            }
+        }
+    }
+    None
 }

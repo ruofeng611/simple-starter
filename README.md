@@ -47,12 +47,22 @@ url = "postgres://user:pass@localhost:5432/mydb"
 use serde::{Deserialize, Serialize};
 use simple_starter_core::tracing::info;
 use simple_starter_core::{AppCoreUtil, Application, anyhow::Result};
-use simple_starter_macro::{component, cron_job, get, json_response, provider};
+use simple_starter_macro::{component, configuration, cron_job, get, json_response, provider};
+use simple_starter_web::axum::extract::State;
 use simple_starter_web::{JsonResponse, WebPlugin, axum, json_response_wrap};
 use std::sync::Arc;
+use toml::{Value, toml};
 
-// --- 1. 定义配置结构 ---
+// --- 1. 定义配置组件 ---
+#[derive(Deserialize, Debug)]
+#[configuration("constant")]
+pub struct ConstantComponent {
+    pub test_name: String,
+    pub any_str: String,
+}
+
 #[derive(Deserialize)]
+#[configuration("database")]
 struct DbConfig {
     url: String,
 }
@@ -66,21 +76,27 @@ struct Database {
 }
 
 impl Database {
-    async fn disconnect(self) {
+    async fn disconnect(self) -> Result<()> {
         info!("🔌 断开数据库连接: {}", self.url);
+        Ok(())
     }
+}
+
+async fn db_destroy(db: Database) -> Result<()> {
+    Database::disconnect(db).await
 }
 
 // --- 3. 工厂模式注册组件 (Provider形式) ---
 // 适用于第三方库对象或需要复杂初始化的对象
 // 参数自动注入上下文或其他组件
-#[provider] // 自动推断返回类型 Database 为组件类型
-async fn db_factory() -> Database {
-    // 从全局配置读取
-    let cfg: DbConfig =
-        AppCoreUtil::get_config_to_struct("database").expect("Failed to load database config");
+
+// 或者#[provider(destroy_method = async |db| Database::disconnect(db).await)]
+#[provider(destroy_method = db_destroy)] // 自动推断返回类型 Database 为组件类型
+async fn db_factory(cfg: Arc<DbConfig>) -> Result<Database> {
     info!("🔗 连接数据库: {}", cfg.url);
-    Database { url: cfg.url }
+    Ok(Database {
+        url: cfg.url.clone(),
+    })
 }
 
 // --- 4. 依赖注入示例 ---
@@ -104,31 +120,40 @@ impl UserService {
 
 // --- 5. Web 路由与控制器 ---
 #[derive(Serialize, Debug)]
-struct UserDto {
+struct User {
     id: u32,
     name: String,
 }
 
 // 自动注册 GET 路由，支持 axum 的 extractors
-#[get("/api/users/{id}")]
+#[get(path = "/user/{id}", state = AppCoreUtil::get_component::<UserService>().unwrap())]
 #[json_response] // 自动将返回值包装为 Json
 async fn get_user(
     axum::extract::Path(id): axum::extract::Path<u32>,
+    State(user_service): State<Arc<UserService>>,
     // 注意：Web Handler 中暂不支持直接属性注入，需手动获取
 ) -> JsonResponse {
-    // 获取组件单例
-    let user_service = AppCoreUtil::get_component::<UserService>().unwrap();
-
     // 使用宏统一处理响应格式 (code, msg, data)
     json_response_wrap!(function_name = "get_user", {
+        // 输出配置组件信息
+        info!("{:?}", AppCoreUtil::get_component::<ConstantComponent>()?);
         if id == 0 {
             return Err(SimpleAppWebError::new(400, "Invalid User ID"));
         }
-        Ok(UserDto {
+        Ok(User {
             id,
             name: user_service.get_user_name(id),
         })
     })
+}
+
+// 手动添加的路由
+#[json_response]
+async fn manual_router() -> User {
+    User {
+        id: 1,
+        name: "Alice".into(),
+    }
 }
 
 // --- 6. 定时任务 ---
@@ -141,17 +166,33 @@ async fn heartbeat_task() {
 fn main() {
     Application::new()
         // 注册 Web 插件 (加载路由、启动 HTTP 服务)
-        .register_plugin(WebPlugin::new())
+        .register_plugin(
+            WebPlugin::new()
+                // 手动添加路由
+                .add_manual_router_factory(|| {
+                    axum::Router::new().route("/manual", axum::routing::get(manual_router))
+                }),
+        )
+        // 添加默认配置
+        .add_default_config(Value::Table(toml! {
+            [constant]
+            test_name = "simple-starter"
+            any_str = "This is a test string"
+
+            [web]
+            base_path = "/api"
+        }))
         .add_startup_hook(async {
             // 手动添加组件
-            let user = UserDto {
+            let user = User {
                 id: 2,
                 name: "Bob".into(),
             };
             AppCoreUtil::register_component(
                 user,
-                Some(move |user: UserDto| async move {
+                Some(move |user: User| async move {
                     info!("User destroyed: {:?}", user);
+                    Ok(())
                 }),
             )
                 .unwrap();
@@ -200,7 +241,7 @@ graph TD
 
     Running --> Signal[收到退出信号 Ctrl+C]
 
-    subgraph Shutdown [优雅停机]
+    subgraph Shutdown [停机]
         StopTasks[12. 停止后台任务]
         ShutdownHooks[13. 执行 Shutdown Hooks]
         PluginStop[14. 逆序关闭插件]

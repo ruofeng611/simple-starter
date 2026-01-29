@@ -17,7 +17,7 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// 组件创建函数签名
 ///
 /// 闭包返回一个 BoxFuture，解析为组件实例 T。
-pub type CreateFn<T> = Box<dyn FnOnce() -> BoxFuture<T> + Send + Sync>;
+pub type CreateFn<T> = Box<dyn FnOnce() -> BoxFuture<anyhow::Result<T>> + Send + Sync>;
 
 /// 组件初始化函数签名
 ///
@@ -27,7 +27,7 @@ pub type InitFn<T> = Box<dyn FnOnce(Arc<T>) -> BoxFuture<anyhow::Result<()>> + S
 /// 组件销毁函数签名
 ///
 /// 接收组件的所有权（T），用于清理资源。
-pub type DestroyFn<T> = Box<dyn FnOnce(T) -> BoxFuture<()> + Send + Sync>;
+pub type DestroyFn<T> = Box<dyn FnOnce(T) -> BoxFuture<anyhow::Result<()>> + Send + Sync>;
 
 /// 异步任务工厂函数签名
 ///

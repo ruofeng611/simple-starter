@@ -27,19 +27,11 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
     // 逻辑：调用 AppCoreUtil::get_config_to_struct 读取配置
     // 注意：这要求目标结构体必须实现了 serde::Deserialize
     let create_fn_impl = quote! {
-        Box::new(move || -> simple_starter_core::BoxFuture<#struct_name> {
+        Box::new(move || -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<#struct_name>> {
             Box::pin(async move {
                 // 尝试从配置路径加载
-                match simple_starter_core::AppCoreUtil::get_config_to_struct::<#struct_name>(#prefix) {
-                    Ok(cfg) => cfg,
-                    Err(e) => {
-                        // 如果配置加载失败，通常是致命错误，这里直接 panic 阻断应用启动
-                        panic!(
-                            "Failed to load configuration component '{}' from prefix '{}': {:?}",
-                            #final_component_name, #prefix, e
-                        );
-                    }
-                }
+                let config = simple_starter_core::AppCoreUtil::get_config_to_struct::<#struct_name>(#prefix)?;
+                Ok(config)
             })
         })
     };

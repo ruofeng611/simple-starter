@@ -13,28 +13,25 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, Tr
 ///
 /// 负责集成 Axum Web 框架，自动发现并注册路由，启动 HTTP 服务。
 pub struct WebPlugin {
-    main_router: Router,
+    manual_router_factory: Vec<Box<dyn FnOnce() -> Router + Send>>,
 }
 
 impl WebPlugin {
     /// 创建 WebPlugin 实例
-    ///
-    /// 在构造时会自动通过 `inventory` 收集所有注册的路由（`RouteFactory`）并合并。
     pub fn new() -> Self {
-        let mut main_router = Router::new();
-        // 1. 遍历收集到的路由工厂，逐个构建并合并
-        for route_factory in inventory::iter::<RouteFactory> {
-            let router = (route_factory.router)();
-            main_router = main_router.merge(router);
+        WebPlugin {
+            manual_router_factory: Vec::new(),
         }
-        Self { main_router }
     }
 
     /// 手动添加额外路由
     ///
     /// 允许在自动收集之外，手动挂载动态构建的路由。
-    pub fn add_route(mut self, router: Router) -> Self {
-        self.main_router = self.main_router.merge(router);
+    pub fn add_manual_router_factory<F>(mut self, factory: F) -> Self
+    where
+        F: FnOnce() -> Router + Send + 'static,
+    {
+        self.manual_router_factory.push(Box::new(factory));
         self
     }
 }
@@ -63,8 +60,18 @@ impl Plugin for WebPlugin {
         let web_config: WebConfig = AppCoreUtil::get_config_to_struct::<WebConfig>("web")
             .context("Failed to load 'web' config section")?;
 
-        // 2. 取出已收集的主路由（移交所有权）
-        let main_router = std::mem::take(&mut self.main_router);
+        // 2. 构建主路由
+        let mut main_router = Router::new();
+        // 遍历自动收集到的路由工厂，逐个构建并合并
+        for route_factory in inventory::iter::<RouteFactory> {
+            let router = (route_factory.router)();
+            main_router = main_router.merge(router);
+        }
+        // 添加手动注册的路由
+        let manual_router_factory = std::mem::take(&mut self.manual_router_factory);
+        for router_factory in manual_router_factory {
+            main_router = main_router.merge(router_factory());
+        }
 
         // 3. 应用 base_path 前缀（如果配置了）
         let mut app_router = if let Some(ref base) = web_config.base_path {

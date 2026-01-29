@@ -63,7 +63,7 @@ impl<T: Any + Send + Sync> ComponentWrapper<T> {
 impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
     async fn create(&mut self) -> anyhow::Result<()> {
         // 执行用户提供的创建函数，生成实例
-        let instance = self.create_fn.take().unwrap()().await;
+        let instance = self.create_fn.take().unwrap()().await?;
         // 将实例封装在 Arc 中，允许共享所有权
         self.inner = Some(Arc::new(instance));
         Ok(())
@@ -86,7 +86,7 @@ impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
                 match Arc::try_unwrap(arc_t) {
                     Ok(t) => {
                         // 成功拿到 T 的所有权，执行销毁逻辑
-                        destroy_fn(t).await
+                        destroy_fn(t).await?;
                     }
                     Err(_arc_t) => {
                         // 失败：说明还有其他地方持有这个 Arc（可能是因为循环引用或逻辑泄露）

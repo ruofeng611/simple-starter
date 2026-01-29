@@ -9,9 +9,10 @@ use crate::utils::app_inner_util::{find_cycle_path, merge_toml_values};
 use crate::{AppCoreUtil, BoxFuture, ComponentProcessorFactory, LogExpectExt};
 use anyhow::{Context, anyhow};
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
 use std::str::FromStr;
 use std::thread::JoinHandle;
+use time::UtcOffset;
+use time::macros::format_description;
 use tokio::runtime::Builder;
 use tokio::task::JoinSet;
 use tokio_cron_scheduler::{Job, JobScheduler};
@@ -19,14 +20,20 @@ use tokio_util::sync::CancellationToken;
 use toml::{Value, toml};
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling;
+use tracing_subscriber::fmt::time::OffsetTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt, registry};
+use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, registry};
 
 /// 应用程序构建器和运行时管理器
 ///
 /// 负责生命周期管理：配置 -> 日志 -> 运行时 -> 组件 -> 插件 -> 任务 -> 退出清理。
 pub struct Application {
+    /// 自定义的Tokio 运行时的创建工厂
+    tokio_runtime_factory: Option<Box<dyn FnOnce() -> tokio::runtime::Runtime + Send>>,
+    /// 自定义的日志layer列表
+    log_layers: Vec<Box<dyn Layer<Registry> + Send + Sync>>,
     /// 异步任务工厂队列
     task_spawns: Vec<TaskFactory>,
     /// 用户注入的默认配置
@@ -55,6 +62,8 @@ impl Application {
     /// 创建一个新的 Application 实例
     pub fn new() -> Self {
         Application {
+            tokio_runtime_factory: None,
+            log_layers: Vec::new(),
             task_spawns: Vec::new(),
             default_config: Vec::new(),
             plugins: Vec::new(),
@@ -68,6 +77,24 @@ impl Application {
             background_handle: None,
             cancel_token: None,
         }
+    }
+
+    /// 设置自定义的Tokio 运行时的创建工厂
+    pub fn set_tokio_runtime_factory<F>(mut self, factory: F) -> Self
+    where
+        F: FnOnce() -> tokio::runtime::Runtime + Send + 'static,
+    {
+        self.tokio_runtime_factory = Some(Box::new(factory));
+        self
+    }
+
+    /// 添加自定的日志layer
+    pub fn add_log_layer<L>(mut self, layer: L) -> Self
+    where
+        L: Layer<Registry> + Send + Sync + 'static,
+    {
+        self.log_layers.push(Box::new(layer));
+        self
     }
 
     /// 注册一个异步任务，随应用启动
@@ -347,10 +374,14 @@ impl Application {
         let default_config = toml! {
             [logger]
             level = "INFO"
+
+            enable_console = true
+
             with_thread_id = true
             with_thread_name = true
-            enable_console = true
-            content_append = true
+
+            file_name = "app.log"
+            max_file_number = 30
 
             [runtime]
             worker_thread_name = "tokio_worker"
@@ -383,19 +414,40 @@ impl Application {
     fn init_tracing(&mut self) -> anyhow::Result<()> {
         let logger_config: LoggerConfig = AppCoreUtil::get_config_to_struct("logger")?;
 
+        // 1. 基础 Filter, 对所有layer生效
         let log_level = tracing::Level::from_str(&logger_config.level)
             .map_err(|_| anyhow::anyhow!("Invalid log level: {}", &logger_config.level))?;
-
         let filter_layer = EnvFilter::builder()
             .with_default_directive(log_level.into()) // 如果没有 RUST_LOG，就用这个
             .from_env_lossy(); // 尝试读取 RUST_LOG，如果格式不对不报错，而是忽略环境变量
 
+        // 2. 内置格式化器，其和内置控制台与文件输出绑定
+        // 2.1. 定义格式
+        let time_fmt = format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]"
+        );
+        // 2.2. 决定时区
+        let offset = if let Some(tz_str) = &logger_config.timezone {
+            // 如果配置了，尝试解析 "+08:00"
+            UtcOffset::parse(
+                tz_str,
+                &format_description!("[offset_hour]:[offset_minute]"),
+            )
+            .context("Invalid timezone format (expect +HH:MM)")?
+        } else {
+            // 默认使用 UTC, 为了和文件输出时tracing-appender只能按照UTC创建文件匹配
+            UtcOffset::UTC
+        };
+
+        // 2.3. 创建 Timer
+        let timer = OffsetTime::new(offset, time_fmt);
         let format_base = fmt::format()
+            .with_timer(timer)
             .with_thread_ids(logger_config.with_thread_id)
             .with_thread_names(logger_config.with_thread_name)
             .compact();
 
-        // 控制台层
+        // 3. 构建内置的控制台层
         let console_layer = if logger_config.enable_console {
             Some(
                 fmt::layer()
@@ -406,21 +458,22 @@ impl Application {
             None
         };
 
-        // 文件层
-        let file_layer = if let Some(ref path_str) = logger_config.save_file {
-            let path = Path::new(path_str);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
+        // 4. 构建内置的文件层 (按天滚动)
+        let file_layer = if let Some(dir) = &logger_config.log_dir {
+            // A. 确保目录存在
+            std::fs::create_dir_all(dir).context("Failed to create log dir")?;
 
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(logger_config.content_append)
-                .open(path)?;
+            // B. 配置按天滚动 (Daily Rolling)
+            // 文件名为: <dir>/<name>.YYYY-MM-DD (例如 logs/app.log.2023-10-27)
+            let file_appender = rolling::Builder::new()
+                .rotation(rolling::Rotation::DAILY)
+                .filename_prefix(&logger_config.file_name)
+                .max_log_files(logger_config.max_file_number)
+                .build(dir)
+                .context("Failed to build file appender")?;
 
             // 创建异步非阻塞 Writer
-            let (non_blocking_writer, guard) = tracing_appender::non_blocking(file);
+            let (non_blocking_writer, guard) = tracing_appender::non_blocking(file_appender);
             // 保存 Guard 到 Application 实例中，让其在程序运行期间一直存在
             self.log_guard = Some(guard);
 
@@ -436,11 +489,18 @@ impl Application {
 
         let effective_level_str = filter_layer.to_string();
 
-        // 注册所有 Layers
+        // 5. 组装所有 Layer
+        let log_layers_vec = std::mem::take(&mut self.log_layers);
+        let log_layers_option = if log_layers_vec.is_empty() {
+            None
+        } else {
+            Some(log_layers_vec)
+        };
         registry()
-            .with(filter_layer)
-            .with(console_layer)
+            .with(log_layers_option)
             .with(file_layer)
+            .with(console_layer)
+            .with(filter_layer)
             .try_init()
             .map_err(|e| anyhow::anyhow!("Failed to init tracing: {:?}", e))?;
 
@@ -455,16 +515,21 @@ impl Application {
 
     /// 初始化 Tokio 运行时
     fn init_runtime(&mut self) -> anyhow::Result<()> {
-        if self.main_loop_hook.is_some() {
-            // 如果有自定义主循环，此处仅创建一个单线程运行时用于启动流程
-            let rt = Builder::new_current_thread()
-                .enable_all()
-                .thread_name("main_starter_runtime")
-                .build()
-                .context("Failed to create current thread Tokio runtime")?;
-            self.tokio_runtime = Some(rt);
+        if let Some(runtime_factory) = self.tokio_runtime_factory.take() {
+            // 如果有自定义运行时工厂，则使用它创建运行时
+            self.tokio_runtime = Some(runtime_factory());
         } else {
-            self.tokio_runtime = Some(create_runtime()?);
+            if self.main_loop_hook.is_some() {
+                // 如果有自定义主循环，此处仅创建一个单线程运行时用于启动流程
+                let rt = Builder::new_current_thread()
+                    .enable_all()
+                    .thread_name("main_starter_runtime")
+                    .build()
+                    .context("Failed to create current thread Tokio runtime")?;
+                self.tokio_runtime = Some(rt);
+            } else {
+                self.tokio_runtime = Some(create_runtime()?);
+            }
         }
         Ok(())
     }
