@@ -154,7 +154,7 @@ fn resolve_component_order(
 
 /// 运行组件创建和初始化
 async fn run_creation_and_init() -> anyhow::Result<()> {
-    // 1. 获取排序好的 Key 列表 (必须 Clone 出来，避免持有锁进行 await)
+    // 1. 获取排序好的 Key 列表 (Clone 出来，避免持有锁进行 await)
     let sorted_keys: Vec<ComponentKey> = {
         let guard = COMPONENT_ORDER
             .lock()
@@ -164,10 +164,7 @@ async fn run_creation_and_init() -> anyhow::Result<()> {
 
     // 2. 阶段一：创建 (Create)
     for key in &sorted_keys {
-        // 处理逻辑上的绝对不可能错误，用 ok_or 转换
-        let mut entry = COMPONENT_REPOSITORY
-            .get_mut(key)
-            .ok_or_else(|| anyhow::anyhow!("Component lost during creation phase: {}", key.1))?;
+        let mut entry = COMPONENT_REPOSITORY.get_mut(key).unwrap();
 
         let processor = entry.value_mut();
         processor
@@ -180,9 +177,7 @@ async fn run_creation_and_init() -> anyhow::Result<()> {
 
     // 3. 阶段二：初始化 (Init)
     for key in &sorted_keys {
-        let mut entry = COMPONENT_REPOSITORY
-            .get_mut(key)
-            .ok_or_else(|| anyhow::anyhow!("Component lost during init phase: {}", key.1))?;
+        let mut entry = COMPONENT_REPOSITORY.get_mut(key).unwrap();
 
         let processor = entry.value_mut();
         processor

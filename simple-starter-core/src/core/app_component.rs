@@ -71,9 +71,10 @@ impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
 
     async fn init(&mut self) -> anyhow::Result<()> {
         if let Some(init_fn) = self.init_fn.take() {
-            // 将 Arc 克隆一份传给初始化函数，方便在 init 中持有 self 的引用
-            let arc_t = self.inner.as_ref().unwrap().clone();
-            init_fn(arc_t).await?;
+            // 将 Arc 克隆一份传给初始化函数
+            if let Some(arc_t) = self.inner.as_ref() {
+                init_fn(arc_t.clone()).await?;
+            }
         }
         Ok(())
     }

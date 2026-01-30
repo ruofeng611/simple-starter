@@ -24,7 +24,7 @@
 
 ```toml
 [app]
-name = "MyAwesomeApp"
+name = "Application"
 
 [logger]
 level = "DEBUG"
@@ -38,20 +38,42 @@ binding = "0.0.0.0"
 
 # 自定义数据库配置
 [database]
-url = "postgres://user:pass@localhost:5432/mydb"
+url = "postgres://postgres:postgres@localhost:5432/practice"
 ```
 
-### 2. 代码实现 (`main.rs`)
+### 2. 依赖项
+```toml
+[package]
+name = "temp"
+version = "0.1.0"
+edition = "2024"
 
+[dependencies]
+simple-starter-core = { path = "../simple-starter/simple-starter-core" }
+simple-starter-macro = { path = "../simple-starter/simple-starter-macro" }
+simple-starter-web = { path = "../simple-starter/simple-starter-web" }
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "0.9.8"
+sea-orm = { version = "1.1.19", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+```
+
+### 3. 代码实现 
+(`main.rs`)
 ```rust
+mod entity;
+
 use serde::{Deserialize, Serialize};
 use simple_starter_core::tracing::info;
-use simple_starter_core::{AppCoreUtil, Application, anyhow::Result};
+use simple_starter_core::{anyhow, AppCoreUtil, Application};
 use simple_starter_macro::{component, configuration, cron_job, get, json_response, provider};
 use simple_starter_web::axum::extract::State;
 use simple_starter_web::{JsonResponse, WebPlugin, axum, json_response_wrap};
 use std::sync::Arc;
+use std::time::Duration;
+use sea_orm::{ActiveModelTrait, ConnectOptions, Database, DatabaseConnection, DbErr, EntityTrait, Set};
 use toml::{Value, toml};
+use crate::entity::prelude::Student;
+use crate::entity::student;
 
 // --- 1. 定义配置组件 ---
 #[derive(Deserialize, Debug)]
@@ -69,91 +91,107 @@ struct DbConfig {
 
 // --- 2. 定义业务组件 (Struct形式) ---
 // destroy_method 指定销毁时调用的方法
-#[component(name = "DatabaseCom", destroy_method = "disconnect")]
+#[component(name = "DatabaseComponent", destroy_method = "disconnect")]
 #[derive(Debug)]
-struct Database {
-    url: String,
+struct DatabaseComponent {
+    url: String,  // 对于组件中没有自动注入的字段，使用 Default trait 提供默认值
 }
 
-impl Database {
-    async fn disconnect(self) -> Result<()> {
-        info!("🔌 断开数据库连接: {}", self.url);
+impl DatabaseComponent {
+    async fn disconnect(self) -> anyhow::Result<()> {
+        info!("🔌 断开数据库连接: {}", self.url); // 这里输出为字符串类型的默认值（空串）
         Ok(())
     }
 }
 
-async fn db_destroy(db: Database) -> Result<()> {
-    Database::disconnect(db).await
+async fn db_destroy(db: DatabaseConnection) -> anyhow::Result<()> {
+    // 显示drop，不过实际上一般不需要
+    std::mem::drop(db);
+    Ok(())
 }
 
 // --- 3. 工厂模式注册组件 (Provider形式) ---
 // 适用于第三方库对象或需要复杂初始化的对象
 // 参数自动注入上下文或其他组件
 
-// 或者#[provider(destroy_method = async |db| Database::disconnect(db).await)]
-#[provider(destroy_method = db_destroy)] // 自动推断返回类型 Database 为组件类型
-async fn db_factory(cfg: Arc<DbConfig>) -> Result<Database> {
-    info!("🔗 连接数据库: {}", cfg.url);
-    Ok(Database {
-        url: cfg.url.clone(),
-    })
+//或者 #[provider(destroy_method = async |db| -> anyhow::Result<()> {
+//         std::mem::drop(db);
+//         Ok(())
+//     }
+// )]
+#[provider(destroy_method = db_destroy)] // 自动推断返回类型 DatabaseConnection 为组件类型
+async fn db_factory(cfg: Arc<DbConfig>) -> Result<DatabaseConnection, DbErr> {
+    let mut opt = ConnectOptions::new(cfg.url.clone(), );
+    opt.max_connections(10)
+        .min_connections(5)
+        .connect_timeout(Duration::from_secs(10))
+        .idle_timeout(Duration::from_secs(60));
+    let db: DatabaseConnection = Database::connect(opt).await?;
+    Ok(db)
 }
 
 // --- 4. 依赖注入示例 ---
 #[component(init_method = "init")]
-struct UserService {
-    // 按类型自动注入 Database 组件 (必须包裹在 Arc 中)
+struct StudentService {
+    // 按类型自动注入DatabaseConnection 组件 (必须包裹在 Arc 中)
     #[inject]
-    db: Arc<Database>,
+    db: Arc<DatabaseConnection>,
 }
 
-impl UserService {
-    async fn init(&self) -> Result<()> {
-        info!("✅ UserService 初始化完成，依赖的 DB URL: {}", self.db.url);
+impl StudentService {
+    async fn init(&self) -> anyhow::Result<()> {
+        // 这里插入一条数据
+        let student = student::ActiveModel {
+            id: Set(12345),
+            student_id: Set("S2025001".into()),
+            name: Set("张三".into()),
+            ..Default::default() // 其他字段用 ActiveModel 的 Default（即 NotSet）
+        };
+        student.insert(self.db.as_ref()).await?;
         Ok(())
     }
 
-    fn get_user_name(&self, id: u32) -> String {
-        format!("User-{}", id)
+    async fn get_student_name(&self, id: i64) -> Option<String> {
+        let res = Student::find_by_id(id).one(self.db.as_ref()).await;
+        match res {
+            Ok(Some(model)) => Some(model.name),
+            _ => None, // 包括 NotFound 和 DB error
+        }
     }
 }
 
 // --- 5. Web 路由与控制器 ---
 #[derive(Serialize, Debug)]
-struct User {
-    id: u32,
+struct StudentVO {
+    id: i64,
     name: String,
 }
 
 // 自动注册 GET 路由，支持 axum 的 extractors
-#[get(path = "/user/{id}", state = AppCoreUtil::get_component::<UserService>().unwrap())]
+#[get(path = "/student/{id}", state = AppCoreUtil::get_component::<StudentService>().unwrap())]
 #[json_response] // 自动将返回值包装为 Json
-async fn get_user(
-    axum::extract::Path(id): axum::extract::Path<u32>,
-    State(user_service): State<Arc<UserService>>,
+async fn get_student_name(
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    State(student_service): State<Arc<StudentService>>,
     // 注意：Web Handler 中暂不支持直接属性注入，需手动获取
 ) -> JsonResponse {
     // 使用宏统一处理响应格式 (code, msg, data)
-    json_response_wrap!(function_name = "get_user", {
-        // 输出配置组件信息
-        info!("{:?}", AppCoreUtil::get_component::<ConstantComponent>()?);
+    json_response_wrap!(function_name = "根据学生id获取学生姓名", {
         if id == 0 {
-            return Err(SimpleAppWebError::new(400, "Invalid User ID"));
+            return Err(SimpleAppWebError::new(400, "无效的学生id"));
         }
-        Ok(User {
+        Ok(StudentVO {
             id,
-            name: user_service.get_user_name(id),
+            name: student_service.get_student_name(id).await.ok_or_else(|| SimpleAppWebError::new(404, "未找到该id相关的学生姓名"))?,
         })
     })
 }
 
 // 手动添加的路由
 #[json_response]
-async fn manual_router() -> User {
-    User {
-        id: 1,
-        name: "Alice".into(),
-    }
+async fn manual_router() -> () {
+    // 输出配置组件信息
+    info!("{:?}", AppCoreUtil::get_component::<ConstantComponent>().unwrap());
 }
 
 // --- 6. 定时任务 ---
@@ -184,28 +222,62 @@ fn main() {
         }))
         .add_startup_hook(async {
             // 手动添加组件
-            let user = User {
-                id: 2,
-                name: "Bob".into(),
+            let database_component = DatabaseComponent {
+                url: "手动添加的组件url".to_string(),
             };
-            AppCoreUtil::register_component(
-                user,
-                Some(move |user: User| async move {
-                    info!("User destroyed: {:?}", user);
-                    Ok(())
+            AppCoreUtil::register_component_with_name(
+                database_component,
+                "DatabaseComponentManual",
+                Some(move |db: DatabaseComponent| async move {
+                    db.disconnect().await
                 }),
-            )
-                .unwrap();
+            )?;
+            Ok(())
         })
         // 添加关闭钩子
         .add_shutdown_hook(async {
             info!("🚀 系统关闭钩子执行！！！");
+            Ok(())
         })
         // 运行应用 (阻塞主线程)
         .run();
 }
 ```
 
+(`src/entity/student.rs`) (sea-orm生成)
+```rust
+//! `SeaORM` Entity, @generated by sea-orm-codegen 1.1.19
+
+use sea_orm::entity::prelude::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize, Default)]
+#[sea_orm(table_name = "student")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: i64,
+    #[sea_orm(unique)]
+    pub student_id: String,
+    pub name: String,
+    pub gender: Option<String>,
+    pub birth_date: Option<Date>,
+    #[sea_orm(unique)]
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub major: Option<String>,
+    pub grade: Option<String>,
+    pub class_name: Option<String>,
+    pub enrollment_date: Option<Date>,
+    pub status: Option<String>,
+    pub created_at: Option<DateTime>,
+    pub updated_at: Option<DateTime>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}
+```
 ---
 
 ## 🔄 启动流程图
@@ -214,42 +286,102 @@ fn main() {
 
 ```mermaid
 graph TD
-    Start[Application::run] --> LoadConfig[1. 加载配置 application.toml]
-    LoadConfig --> InitLog[2. 初始化 Tracing 日志系统]
-    InitLog --> InitRuntime[3. 初始化 Tokio Runtime]
+%% 定义样式
+    classDef file fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
+    classDef logic fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+    classDef critical fill:#ffccbc,stroke:#d84315,stroke-width:2px;
+    classDef component fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
 
-    subgraph ComponentLifecycle [组件生命周期]
-        Scan[4. Inventory 扫描元数据]
-        TopoSort[5. 计算依赖拓扑排序]
-        Create["6. 执行组件 create()"]
-        Init["7. 执行组件 init()"]
-    end
+    Start([Application::run]) --> ConfigPhase
 
-    InitRuntime --> ComponentLifecycle
+%% ---------------------------
+%% 1. 配置加载阶段 (config_loader.rs)
+%% ---------------------------
+subgraph ConfigPhase [阶段一：配置加载]
+direction TB
+LoadGlobal[global_config_load] --> LoadBase[读取 application.toml]
+LoadBase --> CheckEnv{检查环境变量 APP_PROFILE}
+CheckEnv -- 存在 --> SetProfile[确定 Profile]
+CheckEnv -- 不存在 --> CheckBaseCfg[检查 base 配置中的 profile 字段]
+CheckBaseCfg --> SetProfile
+SetProfile --> LoadProfileCfg["读取 application-&lt;profile&gt;.toml"]
+LoadProfileCfg --> MergeCfg[合并用户配置]
+MergeCfg --> MergeDefault[合并代码内置默认配置]
+MergeDefault --> SetGlobalConfig[写入 GLOBAL_CONFIG]
+end
 
-    subgraph Plugins [插件系统]
-        PluginSort[8. 插件依赖排序]
-        PluginInit["9. 执行 Plugin::init()"]
-        WebStart[WebPlugin: 启动 HTTP Server]
-    end
+ConfigPhase --> InfraPhase
 
-    ComponentLifecycle --> Plugins
-    Plugins --> Hooks[10. 执行 Startup Hooks]
-    Hooks --> Scheduler[11. 启动 Cron 调度器]
+%% ---------------------------
+%% 2. 基础设施初始化 (application.rs)
+%% ---------------------------
+subgraph InfraPhase [阶段二：基础设施初始化]
+direction TB
+InitTrace[init_tracing: 初始化日志系统]:::critical
+InitTrace --> CheckRtFactory{是否有自定义 Runtime 工厂?}
+CheckRtFactory -- Yes --> CreateCustomRt[创建自定义 Tokio Runtime]
+CheckRtFactory -- No --> CreateDefaultRt[创建默认/多线程 Tokio Runtime]
+CreateCustomRt --> SaveRt[保存 Runtime 到 App]
+CreateDefaultRt --> SaveRt
+end
 
-    Scheduler --> Running(("运行中 / 等待信号"))
+SaveRt --> StartInternal
 
-    Running --> Signal[收到退出信号 Ctrl+C]
+%% ---------------------------
+%% 3. 组件与插件加载 (component_loader.rs & application.rs)
+%% ---------------------------
+subgraph StartInternal [阶段三：组件与插件启动]
+direction TB
 
-    subgraph Shutdown [停机]
-        StopTasks[12. 停止后台任务]
-        ShutdownHooks[13. 执行 Shutdown Hooks]
-        PluginStop[14. 逆序关闭插件]
-        DestroyCom["15. 逆序执行组件 destroy()"]
-    end
+subgraph ComponentLoad [组件加载流程 component_repository_load]
+RegisterComps[register_components]:::component
+RegisterComps --> ScanInv[扫描 inventory 收集工厂]
+ScanInv --> CheckDup[检查名称唯一性]
+CheckDup --> BuildDep[构建依赖关系图]
+BuildDep --> TopoSort[Kahn 拓扑排序计算启动顺序]
+TopoSort --> SaveOrder[保存顺序到 COMPONENT_ORDER]
 
-    Signal --> Shutdown
-    Shutdown --> End[退出]
+SaveOrder --> RunCreateInit[run_creation_and_init]:::component
+RunCreateInit --> CreatePhase[遍历顺序: 执行 create]
+CreatePhase --> InitPhase[遍历顺序: 执行 init]
+end
+
+ComponentLoad --> PluginLoad
+
+subgraph PluginLoad [插件加载流程]
+SortPlugins[插件依赖拓扑排序]
+SortPlugins --> InitPlugins[执行插件 init]
+end
+
+PluginLoad --> Hooks[执行 Startup Hooks]
+end
+
+Hooks --> LoopDecision
+
+%% ---------------------------
+%% 4. 运行模式决策 (application.rs)
+%% ---------------------------
+subgraph LoopDecision [阶段四：运行模式决策]
+CheckHook{是否设置 main_loop_hook?}:::logic
+
+%% 模式 A: 自定义主循环
+CheckHook -- Yes GUI/Custom Mode --> SpwanBg[Spawn 后台线程]
+SpwanBg --> BgRuntime[创建后台 Runtime]
+BgRuntime --> StartCronBg[启动 CronJob 调度器]
+StartCronBg --> StartTasksBg[启动 TaskFactory 异步任务]
+StartTasksBg --> UserLoop[执行用户自定义 Main Loop]:::critical
+
+%% 模式 B: 默认主循环
+CheckHook -- No Server Mode --> MainRuntime[使用主 Runtime]
+MainRuntime --> StartCron[启动 CronJob 调度器]
+StartCron --> StartTasks[启动 TaskFactory 异步任务]
+StartTasks --> WaitSignal[阻塞等待 Ctrl+C / SIGTERM]:::critical
+end
+
+UserLoop --> ShutdownFlow
+WaitSignal --> ShutdownFlow
+
+ShutdownFlow([进入关闭流程 shutdown])
 ```
 
 ---

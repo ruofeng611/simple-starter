@@ -41,9 +41,9 @@ pub struct Application {
     /// 注册的插件列表
     plugins: Vec<Box<dyn Plugin>>,
     /// 启动钩子
-    startup_hooks: Vec<BoxFuture<()>>,
+    startup_hooks: Vec<BoxFuture<anyhow::Result<()>>>,
     /// 关闭钩子
-    shutdown_hooks: Vec<BoxFuture<()>>,
+    shutdown_hooks: Vec<BoxFuture<anyhow::Result<()>>>,
     /// 自定义主循环钩子
     main_loop_hook: Option<Box<dyn FnOnce(Application) + Send>>,
 
@@ -133,7 +133,7 @@ impl Application {
     /// 添加启动后立即执行的钩子
     pub fn add_startup_hook<F>(mut self, hook: F) -> Self
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         self.startup_hooks.push(Box::pin(hook));
         self
@@ -142,7 +142,7 @@ impl Application {
     /// 添加关闭前执行的钩子
     pub fn add_shutdown_hook<F>(mut self, hook: F) -> Self
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         self.shutdown_hooks.push(Box::pin(hook));
         self
@@ -164,19 +164,18 @@ impl Application {
         // 1. 加载全局配置
         if let Err(e) = global_config_load(self.get_merged_default_config()) {
             eprintln!("FATAL: Configuration Load Failed: {:?}", e);
-            std::process::exit(1);
+            return;
         }
 
         // 2. 初始化 Tracing 日志系统
         if let Err(e) = self.init_tracing() {
             eprintln!("FATAL: Tracing Init Failed: {:?}", e);
-            std::process::exit(1);
+            return;
         }
 
         // 3. 读取并打印关键配置信息
         let app_config: AppConfig =
             AppCoreUtil::get_config_to_struct("app").log_expect("Failed to get app config");
-
         if let Some(ref profile) = app_config.profile {
             info!("Active configuration profile: '{}'", profile);
         } else {
@@ -186,60 +185,63 @@ impl Application {
         // 4. 初始化 Tokio 运行时
         if let Err(e) = self.init_runtime() {
             error!("Failed to initialize tokio runtime: {:?}", e);
-            std::process::exit(1);
+            return;
         }
 
-        // 5. 加载组件仓库 (Inventory 模式)
+        // 5. 执行启动方法
+        if let Err(e) = self.start() {
+            error!("Failed to start application: {:?}", e);
+            // 由于可能初始化了一些资源，这里调用shutdown方法清理已经创建的资源
+            self.shutdown();
+            return;
+        }
+
+        // 6. 启动运行阶段 (Main Loop)
+        let has_cron_jobs = inventory::iter::<CronJob>.into_iter().next().is_some();
+        if let Some(main_loop) = self.main_loop_hook.take() {
+            // 模式 A: 自定义主循环 (GUI 等)
+            self.run_custom_loop_mode(main_loop, has_cron_jobs);
+        } else {
+            // 模式 B: 默认主循环 (命令行/服务)
+            self.run_default_loop_mode(has_cron_jobs, app_config);
+        }
+    }
+
+    fn start(&mut self) -> anyhow::Result<()> {
+        // 1. 加载组件仓库 (Inventory 模式)
         if inventory::iter::<ComponentProcessorFactory>
             .into_iter()
             .next()
             .is_some()
         {
             let handle = self.tokio_runtime.as_ref().unwrap().handle().clone();
-            if let Err(e) = handle.block_on(component_repository_load()) {
-                error!("Failed to load component repository: {:?}", e);
-                std::process::exit(1);
-            }
+            handle.block_on(component_repository_load())?;
         }
 
-        // 6. 初始化插件
+        // 2. 初始化插件
         if !self.plugins.is_empty() {
-            // 6.1 插件排序 (依赖检查)
-            if let Err(e) = self.sort_plugins_by_dependency() {
-                error!("Failed to sort plugins by dependency: {:?}", e);
-                std::process::exit(1);
-            }
-
-            // 6.2 插件初始化
-            if let Err(e) = self.init_plugins() {
-                error!("Failed to initialize plugins: {:?}", e);
-                std::process::exit(1);
-            }
+            // 2.1 插件排序 (依赖检查)
+            self.sort_plugins_by_dependency()?;
+            // 2.2 插件初始化
+            self.init_plugins()?;
         }
 
-        // 7. 执行启动钩子
+        // 3. 执行启动钩子
         if !self.startup_hooks.is_empty() {
             let mut startup_hooks = std::mem::take(&mut self.startup_hooks);
             let handle = self.tokio_runtime.as_ref().unwrap().handle().clone();
-
             handle.block_on(async move {
                 for hook in startup_hooks.drain(..) {
-                    hook.await;
+                    if let Err(e) = hook.await {
+                        return Err(anyhow!("Startup hook failed: {:?}", e));
+                    }
                 }
-            });
+                Ok(())
+            })?;
             info!("All startup hooks executed");
         }
 
-        // 8. 启动运行阶段 (Main Loop)
-        let has_cron_jobs = inventory::iter::<CronJob>.into_iter().next().is_some();
-
-        if let Some(main_loop) = self.main_loop_hook.take() {
-            // 模式 A: 自定义主循环 (GUI 等)
-            self.run_custom_loop_mode(main_loop, has_cron_jobs);
-        } else {
-            // 模式 B: 默认主循环 (命令行/服务)
-            self.run_default_loop_mode(has_cron_jobs, &app_config);
-        }
+        Ok(())
     }
 
     /// 运行自定义主循环模式
@@ -259,7 +261,14 @@ impl Application {
                 rt.block_on(async move {
                     // 初始化调度器
                     let mut scheduler = if has_cron_jobs {
-                        Some(create_scheduler().await)
+                        match create_scheduler().await {
+                            Ok(scheduler) => Some(scheduler),
+                            Err(e) => {
+                                // 由于控制权需要移到用户自定义函数中，这里后台线程中启动定时任务失败只打印错误
+                                error!("Failed to create scheduler: {:?}", e);
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
@@ -281,7 +290,7 @@ impl Application {
                     cancel_token.cancelled().await;
                     info!("Background tasks received shutdown signal.");
 
-                    // 优雅关闭调度器
+                    // 关闭调度器
                     if let Some(mut scheduler) = scheduler.take() {
                         if let Err(e) = scheduler.shutdown().await {
                             error!("Failed to shutdown scheduler: {:?}", e);
@@ -310,14 +319,22 @@ impl Application {
     }
 
     /// 运行默认主循环模式
-    fn run_default_loop_mode(mut self, has_cron_jobs: bool, app_config: &AppConfig) {
+    fn run_default_loop_mode(mut self, has_cron_jobs: bool, app_config: AppConfig) {
         let cancel_token = CancellationToken::new();
         let mut task_spawns = std::mem::take(&mut self.task_spawns);
         let rt = self.tokio_runtime.take().unwrap();
 
         rt.block_on(async move {
             let mut scheduler = if has_cron_jobs {
-                Some(create_scheduler().await)
+                match create_scheduler().await {
+                    Ok(scheduler) => Some(scheduler),
+                    Err(e) => {
+                        // 定时任务创建失败也视为整个应用启动失败
+                        error!("Failed to create scheduler: {:?}", e);
+                        self.inner_shutdown().await;
+                        return;
+                    }
+                }
             } else {
                 None
             };
@@ -647,7 +664,7 @@ impl Application {
         }
     }
 
-    /// 内部关闭流程
+    /// 内部关闭流程, 关闭流程中出现错误只打印错误不退出程序, 让每个关闭函数都能执行
     async fn inner_shutdown(&mut self) {
         // 取消令牌发起取消信息
         if let Some(cancel_token) = self.cancel_token.take() {
@@ -667,7 +684,9 @@ impl Application {
         if !self.shutdown_hooks.is_empty() {
             let mut shutdown_hooks = std::mem::take(&mut self.shutdown_hooks);
             for hook in shutdown_hooks.drain(..) {
-                hook.await;
+                if let Err(e) = hook.await {
+                    error!("Shutdown hook failed: {:?}", e);
+                }
             }
             info!("All shutdown hooks executed.")
         }
@@ -729,10 +748,8 @@ async fn shutdown_signal() {
 }
 
 /// 创建调度器并加载任务
-async fn create_scheduler() -> JobScheduler {
-    let scheduler = JobScheduler::new()
-        .await
-        .log_expect("Failed to create scheduler");
+async fn create_scheduler() -> anyhow::Result<JobScheduler> {
+    let scheduler = JobScheduler::new().await?;
 
     for job_desc in inventory::iter::<CronJob> {
         let name = job_desc.name;
@@ -742,19 +759,14 @@ async fn create_scheduler() -> JobScheduler {
         info!("Scheduling Job: [{}] expr: '{}'", name, cron_expr);
 
         let job = Job::new_async(cron_expr, move |_uuid, _l| runner())
-            .log_expect(&format!("Invalid cron expression for job {}", name));
+            .context(format!("Invalid cron expression for job {}", name))?;
 
-        scheduler
-            .add(job)
-            .await
-            .log_expect("Failed to add cron job to scheduler");
+        scheduler.add(job).await?;
     }
 
-    scheduler
-        .start()
-        .await
-        .log_expect("Failed to start scheduler");
-    scheduler
+    scheduler.start().await?;
+
+    Ok(scheduler)
 }
 
 /// 创建 Tokio 运行时
