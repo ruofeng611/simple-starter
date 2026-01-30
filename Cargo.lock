@@ -873,7 +873,7 @@ dependencies = [
 
 [[package]]
 name = "simple-starter-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "simple-starter-macro"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "simple-starter-web"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "axum",

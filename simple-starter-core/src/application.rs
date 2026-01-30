@@ -389,6 +389,8 @@ impl Application {
     /// 获取系统硬编码的默认配置
     fn get_app_default_config(&self) -> Value {
         let default_config = toml! {
+            [app]
+
             [logger]
             level = "INFO"
 
