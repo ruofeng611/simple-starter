@@ -286,102 +286,95 @@ impl ActiveModelBehavior for ActiveModel {}
 
 ```mermaid
 graph TD
-%% 定义样式
-    classDef file fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
-    classDef logic fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
-    classDef critical fill:#ffccbc,stroke:#d84315,stroke-width:2px;
-    classDef component fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px;
+%% Nodes
+    Start([Application::run]) --> ConfigLoad
 
-    Start([Application::run]) --> ConfigPhase
+    subgraph S_Config [1. 配置与日志加载]
+        ConfigLoad[加载全局配置] --> LoadBase["加载 application.toml"]
+        LoadBase --> CheckProfile{是否存在 Profile?}
+        CheckProfile -- 是 --> LoadProfile["加载 application-{profile}.toml"]
+        LoadProfile --> MergeConfig[合并配置: 默认 + 基础 + Profile]
+        CheckProfile -- 否 --> MergeConfig
+        MergeConfig --> InitTracing[初始化 Tracing 日志系统]
+        InitTracing --> SetupLayers[设置日志层 & 文件守卫]
+    end
 
-%% ---------------------------
-%% 1. 配置加载阶段 (config_loader.rs)
-%% ---------------------------
-subgraph ConfigPhase [阶段一：配置加载]
-direction TB
-LoadGlobal[global_config_load] --> LoadBase[读取 application.toml]
-LoadBase --> CheckEnv{检查环境变量 APP_PROFILE}
-CheckEnv -- 存在 --> SetProfile[确定 Profile]
-CheckEnv -- 不存在 --> CheckBaseCfg[检查 base 配置中的 profile 字段]
-CheckBaseCfg --> SetProfile
-SetProfile --> LoadProfileCfg["读取 application-&lt;profile&gt;.toml"]
-LoadProfileCfg --> MergeCfg[合并用户配置]
-MergeCfg --> MergeDefault[合并代码内置默认配置]
-MergeDefault --> SetGlobalConfig[写入 GLOBAL_CONFIG]
+    subgraph S_Runtime [2. 运行时初始化]
+        SetupLayers --> InitRuntime[初始化 Tokio 运行时]
+        InitRuntime --> CheckFactory{是否有自定义工厂?}
+        CheckFactory -- 是 --> UseFactory[使用自定义运行时工厂]
+        CheckFactory -- 否 --> BuildRuntime[构建 多线程/单线程 运行时]
+    end
+
+subgraph S_Start [3. 启动阶段]
+UseFactory --> CallStart["调用 self.start()"]
+BuildRuntime --> CallStart
+
+CallStart --> CheckComps{是否存在组件?}
+
+%% Component Loading Logic from component_loader.rs
+subgraph S_Components [组件加载流程]
+CheckComps -- 是 --> CompLoad[加载组件仓库]
+CompLoad --> CompReg[注册并检查名称唯一性]
+CompReg --> CompTopo[计算依赖拓扑顺序]
+CompTopo --> CompCycle{检测到循环依赖?}
+CompCycle -- 是 --> Error[返回错误]
+CompCycle -- 否 --> CompCreate["循环: processor.create()"]
+CompCreate --> CompInit["循环: processor.init()"]
 end
 
-ConfigPhase --> InfraPhase
+CheckComps -- 否 --> CheckPlugins
+CompInit --> CheckPlugins{是否存在插件?}
 
-%% ---------------------------
-%% 2. 基础设施初始化 (application.rs)
-%% ---------------------------
-subgraph InfraPhase [阶段二：基础设施初始化]
-direction TB
-InitTrace[init_tracing: 初始化日志系统]:::critical
-InitTrace --> CheckRtFactory{是否有自定义 Runtime 工厂?}
-CheckRtFactory -- Yes --> CreateCustomRt[创建自定义 Tokio Runtime]
-CheckRtFactory -- No --> CreateDefaultRt[创建默认/多线程 Tokio Runtime]
-CreateCustomRt --> SaveRt[保存 Runtime 到 App]
-CreateDefaultRt --> SaveRt
+%% Plugin Logic
+subgraph S_Plugins [插件加载流程]
+CheckPlugins -- 是 --> PluginSort[按依赖排序插件]
+PluginSort --> PluginInit["循环: plugin.init()"]
 end
 
-SaveRt --> StartInternal
-
-%% ---------------------------
-%% 3. 组件与插件加载 (component_loader.rs & application.rs)
-%% ---------------------------
-subgraph StartInternal [阶段三：组件与插件启动]
-direction TB
-
-subgraph ComponentLoad [组件加载流程 component_repository_load]
-RegisterComps[register_components]:::component
-RegisterComps --> ScanInv[扫描 inventory 收集工厂]
-ScanInv --> CheckDup[检查名称唯一性]
-CheckDup --> BuildDep[构建依赖关系图]
-BuildDep --> TopoSort[Kahn 拓扑排序计算启动顺序]
-TopoSort --> SaveOrder[保存顺序到 COMPONENT_ORDER]
-
-SaveOrder --> RunCreateInit[run_creation_and_init]:::component
-RunCreateInit --> CreatePhase[遍历顺序: 执行 create]
-CreatePhase --> InitPhase[遍历顺序: 执行 init]
+CheckPlugins -- 否 --> StartHooks
+PluginInit --> StartHooks[执行启动钩子 Startup Hooks]
 end
 
-ComponentLoad --> PluginLoad
+subgraph S_Execution [4. 主运行循环]
+StartHooks --> CheckMainLoop{是否有自定义主循环?}
 
-subgraph PluginLoad [插件加载流程]
-SortPlugins[插件依赖拓扑排序]
-SortPlugins --> InitPlugins[执行插件 init]
+%% Custom Main Loop Path
+CheckMainLoop -- 是 (如 GUI) --> SpawnCore[后台派发 App 核心管理任务]
+SpawnCore --> UserLoop[执行用户自定义主循环钩子]
+UserLoop --> UserShutdown["用户手动调用 shutdown()"]
+
+%% Default Main Loop Path
+CheckMainLoop -- 否 (默认) --> BlockCore[阻塞等待 App 核心任务]
+
+subgraph S_CoreTask [核心任务逻辑]
+BlockCore --> SchedCreate[创建并启动 Cron 调度器]
+SchedCreate --> TaskSpawn[派发注册的异步任务]
+TaskSpawn --> WaitSignal[等待退出信号 Ctrl+C / SIGTERM]
 end
 
-PluginLoad --> Hooks[执行 Startup Hooks]
+WaitSignal --> AutoShutdown[触发自动关闭流程]
 end
 
-Hooks --> LoopDecision
+subgraph S_Shutdown [5. 关闭流程]
+UserShutdown --> ShutdownStart["执行 shutdown()"]
+AutoShutdown --> ShutdownStart
 
-%% ---------------------------
-%% 4. 运行模式决策 (application.rs)
-%% ---------------------------
-subgraph LoopDecision [阶段四：运行模式决策]
-CheckHook{是否设置 main_loop_hook?}:::logic
-
-%% 模式 A: 自定义主循环
-CheckHook -- Yes GUI/Custom Mode --> SpwanBg[Spawn 后台线程]
-SpwanBg --> BgRuntime[创建后台 Runtime]
-BgRuntime --> StartCronBg[启动 CronJob 调度器]
-StartCronBg --> StartTasksBg[启动 TaskFactory 异步任务]
-StartTasksBg --> UserLoop[执行用户自定义 Main Loop]:::critical
-
-%% 模式 B: 默认主循环
-CheckHook -- No Server Mode --> MainRuntime[使用主 Runtime]
-MainRuntime --> StartCron[启动 CronJob 调度器]
-StartCron --> StartTasks[启动 TaskFactory 异步任务]
-StartTasks --> WaitSignal[阻塞等待 Ctrl+C / SIGTERM]:::critical
+ShutdownStart --> CancelToken[取消异步任务 Token]
+CancelToken --> WaitCore[等待核心任务结束]
+WaitCore --> DownHooks[执行关闭钩子 Shutdown Hooks]
+DownHooks --> PluginDown["插件关闭 (逆序)"]
+PluginDown --> CompDown["组件销毁 (逆序)"]
+CompDown --> End([程序退出])
 end
 
-UserLoop --> ShutdownFlow
-WaitSignal --> ShutdownFlow
-
-ShutdownFlow([进入关闭流程 shutdown])
+%% Styles
+style Start fill:#f9f,stroke:#333,stroke-width:2px
+style End fill:#f9f,stroke:#333,stroke-width:2px
+style Error fill:#f00,stroke:#333,color:#fff
+style S_Config fill:#e1f5fe,stroke:#01579b
+style S_Components fill:#fff3e0,stroke:#e65100
+style S_Shutdown fill:#ffebee,stroke:#b71c1c
 ```
 
 ---
