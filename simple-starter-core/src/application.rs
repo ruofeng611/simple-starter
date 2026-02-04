@@ -93,6 +93,16 @@ impl Application {
         self.tokio_runtime.as_mut().unwrap()
     }
 
+    /// 获取存储的 Tokio 运行时的所有权
+    pub fn take_runtime(&mut self) -> tokio::runtime::Runtime {
+        self.tokio_runtime.take().unwrap()
+    }
+
+    /// 将 Tokio 运行时放到内部
+    pub fn set_runtime(&mut self, runtime: tokio::runtime::Runtime) {
+        self.tokio_runtime = Some(runtime);
+    }
+
     /// 设置自定义的 Tokio 运行时的创建工厂
     pub fn set_tokio_runtime_factory<F>(mut self, factory: F) -> Self
     where
@@ -532,12 +542,14 @@ impl Application {
     /// 初始化插件列表
     fn init_plugins(&mut self) -> anyhow::Result<()> {
         let mut plugins = std::mem::take(&mut self.plugins);
-        let handle = self.tokio_runtime.as_ref().unwrap().handle().clone();
+
+        // 把 runtime 临时移出 self
+        let rt = self.tokio_runtime.take().unwrap();
 
         // 这里的技巧是传入 &mut *self 来绕过借用检查
         let app = &mut *self;
 
-        let result = handle.block_on(async move {
+        let result = rt.block_on(async move {
             for plugin in plugins.iter_mut() {
                 match plugin.init(app).await {
                     Ok(_) => {
@@ -553,6 +565,9 @@ impl Application {
             // 初始化成功后，必须把 plugins 返回出来，否则它就被丢弃了
             Ok(plugins)
         });
+
+        // 把 runtime 放回去
+        self.tokio_runtime = Some(rt);
 
         match result {
             Ok(p) => {
