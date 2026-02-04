@@ -109,7 +109,7 @@ impl Plugin for WebPlugin {
             })?;
 
         // 6. 将 Web 服务注册为应用的后台任务
-        ctx.add_task_spawn_in_runtime(move |cancel_token| async move {
+        ctx.add_task_spawn_factory_in_context(move |cancel_token| async move {
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .context("Failed to bind TCP listener")?;

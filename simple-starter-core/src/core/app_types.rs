@@ -3,6 +3,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::{Layer, Registry};
 
 /// 组件唯一标识符：由类型 ID 和 自定义名称组成
 pub type ComponentKey = (TypeId, String);
@@ -29,8 +30,18 @@ pub type InitFn<T> = Box<dyn FnOnce(Arc<T>) -> BoxFuture<anyhow::Result<()>> + S
 /// 接收组件的所有权（T），用于清理资源。
 pub type DestroyFn<T> = Box<dyn FnOnce(T) -> BoxFuture<anyhow::Result<()>> + Send + Sync>;
 
+/// Tokio 运行时工厂函数签名
+/// 
+/// 创建 Tokio 运行时实例。
+pub type TokioRuntimeFactory = Box<dyn FnOnce() -> anyhow::Result<tokio::runtime::Runtime> + Send>;
+
+/// 日志层工厂函数签名
+/// 
+/// 创建日志层实例。
+pub type LogLayersFactory = Box<dyn FnOnce() -> Box<dyn Layer<Registry> + Send + Sync> + Send>;
+
 /// 异步任务工厂函数签名
 ///
 /// 接收取消令牌（CancellationToken），返回一个可执行的 Future。
 /// 用于将后台任务注入到运行时中。
-pub type TaskFactory = Box<dyn FnOnce(CancellationToken) -> BoxFuture<anyhow::Result<()>> + Send>;
+pub type TaskSpawnsFactory = Box<dyn FnOnce(CancellationToken) -> BoxFuture<anyhow::Result<()>> + Send>;
