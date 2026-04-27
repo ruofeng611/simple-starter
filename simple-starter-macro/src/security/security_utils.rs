@@ -153,25 +153,3 @@ pub(crate) fn extract_controller_name(ty: &syn::Type) -> String {
     "Controller".to_string()
 }
 
-/// 将路径参数从 `{id}` 格式转换为 Axum 的 `:id` 格式。
-pub(crate) fn convert_path_params(path: &str) -> String {
-    let mut result = String::with_capacity(path.len());
-    let mut chars = path.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '{' {
-            // 跳过直到 }
-            result.push(':');
-            while let Some(inner) = chars.next() {
-                if inner == '}' {
-                    break;
-                }
-                result.push(inner);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result
-}

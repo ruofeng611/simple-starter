@@ -1,16 +1,18 @@
 //! 认证与授权中间件。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::whitelist::Whitelist;
+use simple_starter_core::tracing;
 use simple_starter_web::axum::{
     body::Body,
     extract::{MatchedPath, State},
+    http,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use simple_starter_core::tracing;
-use crate::whitelist::Whitelist;
 
 /// 用户上下文。
 ///
@@ -19,8 +21,8 @@ use crate::whitelist::Whitelist;
 pub struct UserContext {
     /// 用户唯一标识
     pub user_id: String,
-    /// 当前用户拥有的资源标识列表
-    pub resource_ids: Vec<String>,
+    /// 当前用户拥有的资源标识集合
+    pub resource_ids: HashSet<String>,
     /// 用户是否被禁用
     pub is_disabled: bool,
     /// 用户过期时间
@@ -31,14 +33,15 @@ pub struct UserContext {
 
 impl UserContext {
     pub fn has_resource(&self, resource_id: &str) -> bool {
-        self.resource_ids.iter().any(|r| r == resource_id)
+        self.resource_ids.contains(resource_id)
     }
 
     /// 检查用户是否已过期。
     ///
     /// 当 `expired_at` 为 `None`（未设置过期时间）时，返回 `false`，表示永不过期。
     pub fn is_expired(&self) -> bool {
-        self.expired_at.map_or(false, |t| t < std::time::SystemTime::now())
+        self.expired_at
+            .map_or(false, |t| t < std::time::SystemTime::now())
     }
 
     /// 检查用户是否处于有效状态（未禁用且未过期）。
@@ -52,14 +55,18 @@ impl UserContext {
 /// 负责从 HTTP 请求中解析出当前用户上下文（如从 JWT Token、Session Cookie 等）。
 #[async_trait::async_trait]
 pub trait UserInfoProvider: Send + Sync {
-    async fn get_user_context(&self, req: &Request<Body>) -> Option<UserContext>;
+    /// 从请求元信息中解析用户上下文。
+    ///
+    /// 使用 `&http::request::Parts` 而非 `&Request<Body>`，
+    /// 以规避 `Body` 非 `Sync` 导致 `async_trait` Future 非 `Send` 的问题。
+    async fn get_user_context(&self, parts: &http::request::Parts) -> Option<UserContext>;
 }
 
 /// 权限检查器。
 ///
 /// 由使用者实现，根据用户上下文和当前资源标识决定是否放行。
 ///
-/// 默认实现 [`DefaultPermissionChecker`] 直接检查用户上下文的 `resource_ids` 列表。
+/// 默认实现 [`DefaultPermissionChecker`] 直接检查用户上下文的 `resource_ids` 集合。
 #[async_trait::async_trait]
 pub trait PermissionChecker: Send + Sync {
     /// 检查用户是否有权访问指定资源。
@@ -97,7 +104,10 @@ pub enum SecurityError {
     ResourceNotFound { pattern: String },
     /// 权限校验不通过。
     #[error("User '{user_id}' denied access to resource '{resource_id}'")]
-    PermissionDenied { user_id: String, resource_id: String },
+    PermissionDenied {
+        user_id: String,
+        resource_id: String,
+    },
 }
 
 /// 安全错误处理器。
@@ -107,12 +117,12 @@ pub enum SecurityError {
 #[async_trait::async_trait]
 pub trait SecurityErrorHandler: Send + Sync {
     /// 未认证（无有效用户上下文）时的响应。
-    async fn unauthorized(&self, req: &Request<Body>) -> Response;
+    async fn unauthorized(&self, parts: &http::request::Parts) -> Response;
 
     /// 无权限（资源不存在、未配置检查器、或检查不通过）时的响应。
     ///
     /// `error` 参数提供精确的错误类型与诊断信息，可用于日志或自定义错误消息。
-    async fn forbidden(&self, req: &Request<Body>, error: &SecurityError) -> Response;
+    async fn forbidden(&self, parts: &http::request::Parts, error: &SecurityError) -> Response;
 }
 
 /// 默认错误处理器。
@@ -122,11 +132,11 @@ pub struct DefaultSecurityErrorHandler;
 
 #[async_trait::async_trait]
 impl SecurityErrorHandler for DefaultSecurityErrorHandler {
-    async fn unauthorized(&self, _req: &Request<Body>) -> Response {
+    async fn unauthorized(&self, _parts: &http::request::Parts) -> Response {
         StatusCode::UNAUTHORIZED.into_response()
     }
 
-    async fn forbidden(&self, _req: &Request<Body>, _error: &SecurityError) -> Response {
+    async fn forbidden(&self, _parts: &http::request::Parts, _error: &SecurityError) -> Response {
         StatusCode::FORBIDDEN.into_response()
     }
 }
@@ -139,6 +149,8 @@ pub struct SecurityMiddlewareState {
     pub permission_checker: Arc<dyn PermissionChecker>,
     pub resource_map: Arc<std::collections::HashMap<String, String>>, // path_pattern -> resource_id
     pub error_handler: Arc<dyn SecurityErrorHandler>,
+    /// 是否打印安全相关的警告日志
+    pub log_warn: bool,
 }
 
 /// Security 全局中间件。
@@ -151,7 +163,7 @@ pub struct SecurityMiddlewareState {
 pub async fn security_middleware(
     State(state): State<SecurityMiddlewareState>,
     matched_path: Option<MatchedPath>,
-    mut req: Request<Body>,
+    req: Request<Body>,
     next: Next,
 ) -> Response {
     let method_str = req.method().as_str().to_string();
@@ -162,27 +174,34 @@ pub async fn security_middleware(
         return next.run(req).await;
     }
 
-    // === 阶段 2: 解析用户上下文 ===
+    // === 阶段 2: 拆分请求，避免 &Request<Body> 非 Send 问题 ===
+    let (parts, body) = req.into_parts();
+
+    // === 阶段 3: 解析用户上下文 ===
     let user_ctx = match state.user_info_provider {
-        Some(ref provider) => match provider.get_user_context(&req).await {
+        Some(ref provider) => match provider.get_user_context(&parts).await {
             Some(ctx) => ctx,
             None => {
-                return state.error_handler.unauthorized(&req).await;
+                return state.error_handler.unauthorized(&parts).await;
             }
         },
         None => {
-            tracing::warn!("SecurityPlugin: UserInfoProvider not configured, rejecting request");
-            return state.error_handler.unauthorized(&req).await;
+            if state.log_warn {
+                tracing::warn!("SecurityPlugin: UserInfoProvider not configured, rejecting request");
+            }
+            return state.error_handler.unauthorized(&parts).await;
         }
     };
 
-    // === 阶段 3: 用户状态检查 ===
+    // === 阶段 4: 用户状态检查 ===
     if user_ctx.is_disabled {
-        tracing::warn!("SecurityPlugin: User '{}' is disabled", user_ctx.user_id);
+        if state.log_warn {
+            tracing::warn!("SecurityPlugin: User '{}' is disabled", user_ctx.user_id);
+        }
         return state
             .error_handler
             .forbidden(
-                &req,
+                &parts,
                 &SecurityError::UserDisabled {
                     user_id: user_ctx.user_id.clone(),
                 },
@@ -190,11 +209,13 @@ pub async fn security_middleware(
             .await;
     }
     if user_ctx.is_expired() {
-        tracing::warn!("SecurityPlugin: User '{}' has expired", user_ctx.user_id);
+        if state.log_warn {
+            tracing::warn!("SecurityPlugin: User '{}' has expired", user_ctx.user_id);
+        }
         return state
             .error_handler
             .forbidden(
-                &req,
+                &parts,
                 &SecurityError::UserExpired {
                     user_id: user_ctx.user_id.clone(),
                 },
@@ -202,37 +223,37 @@ pub async fn security_middleware(
             .await;
     }
 
-    // 将用户上下文附加到请求，供下游 handler 使用
-    req.extensions_mut().insert(user_ctx.clone());
-
-    // === 阶段 4: 权限检查 ===
-    // 获取当前请求匹配的路径模式
+    // === 阶段 5: 权限检查 ===
     let pattern = match matched_path {
         Some(mp) => mp.as_str().to_string(),
         None => {
-            tracing::warn!(
-                "SecurityPlugin: MatchedPath not available for {} {}",
-                method_str, path_str
-            );
+            if state.log_warn {
+                tracing::warn!(
+                    "SecurityPlugin: MatchedPath not available for {} {}",
+                    method_str,
+                    path_str
+                );
+            }
             return state
                 .error_handler
-                .forbidden(&req, &SecurityError::MatchedPathUnavailable)
+                .forbidden(&parts, &SecurityError::MatchedPathUnavailable)
                 .await;
         }
     };
 
-    // 查找路径模式对应的资源标识
     let resource_id = match state.resource_map.get(&pattern) {
         Some(id) => id.clone(),
         None => {
-            tracing::warn!(
-                "SecurityPlugin: No resource registered for path pattern '{}'",
-                pattern
-            );
+            if state.log_warn {
+                tracing::warn!(
+                    "SecurityPlugin: No resource registered for path pattern '{}'",
+                    pattern
+                );
+            }
             return state
                 .error_handler
                 .forbidden(
-                    &req,
+                    &parts,
                     &SecurityError::ResourceNotFound {
                         pattern: pattern.clone(),
                     },
@@ -241,25 +262,33 @@ pub async fn security_middleware(
         }
     };
 
-    // 调用权限检查逻辑
-    let allowed = state.permission_checker.check(&user_ctx, &resource_id).await;
+    let allowed = state
+        .permission_checker
+        .check(&user_ctx, &resource_id)
+        .await;
 
-    if allowed {
-        next.run(req).await
-    } else {
-        tracing::warn!(
-            "SecurityPlugin: User '{}' denied access to resource '{}'",
-            user_ctx.user_id, resource_id
-        );
-        state
+    if !allowed {
+        if state.log_warn {
+            tracing::warn!(
+                "SecurityPlugin: User '{}' denied access to resource '{}'",
+                user_ctx.user_id,
+                resource_id
+            );
+        }
+        return state
             .error_handler
             .forbidden(
-                &req,
+                &parts,
                 &SecurityError::PermissionDenied {
                     user_id: user_ctx.user_id.clone(),
                     resource_id,
                 },
             )
-            .await
+            .await;
     }
+
+    // === 阶段 6: 重建请求，附加用户上下文，放行 ===
+    let mut req = Request::from_parts(parts, body);
+    req.extensions_mut().insert(user_ctx);
+    next.run(req).await
 }

@@ -9,10 +9,8 @@ mod whitelist;
 
 // 公共导出
 pub use auth_middleware::{
-    security_middleware, DefaultPermissionChecker, DefaultSecurityErrorHandler, PermissionChecker,
-    SecurityError, SecurityErrorHandler, SecurityMiddlewareState, UserContext, UserInfoProvider,
+    PermissionChecker, SecurityError, SecurityErrorHandler, UserContext, UserInfoProvider,
 };
-pub use resource::ResourceEntry;
-pub use security_plugin::SecurityPlugin;
-pub use whitelist::{Whitelist, WhitelistEntry};
 pub use inventory::submit;
+pub use resource::ResourceEntry;
+pub use security_plugin::{BasePathProvider, SecurityPlugin};

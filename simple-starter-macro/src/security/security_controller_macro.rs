@@ -93,7 +93,6 @@ pub(crate) fn security_controller_macro(args: TokenStream, input: TokenStream) -
             };
 
             let full_path = combine_paths(&base_path, &method_path);
-            let axum_path = convert_path_params(&full_path);
             let method_name = method.sig.ident.to_string();
 
             let default_resource = format!("{}::{}", controller_name, method_name);
@@ -103,7 +102,7 @@ pub(crate) fn security_controller_macro(args: TokenStream, input: TokenStream) -
             registrations.push(quote! {
                 ::simple_starter_security::submit! {
                     ::simple_starter_security::ResourceEntry {
-                        path_pattern: #axum_path,
+                        path_pattern: #full_path,
                         resource_id: #resource_id,
                         resource_name: #resource_name,
                         module_id: #module_id,

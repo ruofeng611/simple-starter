@@ -116,12 +116,10 @@ fn security_on_fn(args: SecurityArgs, func: ItemFn) -> TokenStream {
     let module_id = args.module_id.unwrap_or_default();
     let module_name = args.module_name.unwrap_or_default();
 
-    let axum_path = convert_path_params(&path);
-
     let register = quote! {
         ::simple_starter_security::submit! {
             ::simple_starter_security::ResourceEntry {
-                path_pattern: #axum_path,
+                path_pattern: #path,
                 resource_id: #resource_id,
                 resource_name: #resource_name,
                 module_id: #module_id,

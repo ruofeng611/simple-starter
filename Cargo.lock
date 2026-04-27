@@ -910,6 +910,7 @@ dependencies = [
  "simple-starter-core",
  "simple-starter-web",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
