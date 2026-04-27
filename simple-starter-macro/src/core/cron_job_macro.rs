@@ -38,8 +38,8 @@ pub(crate) fn cron_job_macro(args: TokenStream, item: TokenStream) -> TokenStrea
         #func
 
         // 注册定时任务
-        simple_starter_core::submit!(
-            simple_starter_core::CronJob {
+        ::simple_starter_core::submit!(
+            ::simple_starter_core::CronJob {
                 name: stringify!(#name),          // 任务名使用函数名
                 cron_expr: #cron_expr_str,        // cron 表达式
                 // runner: 构造一个无捕获闭包，适配调度器接口

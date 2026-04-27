@@ -1,3 +1,4 @@
+use crate::utils::macro_build_util::combine_paths;
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
@@ -9,10 +10,9 @@ use syn::{parse_macro_input, Ident, ImplItem, ItemImpl, LitStr};
 /// 1. 解析基础路径参数（如 `#[rest_controller("/api")]`）。
 /// 2. 扫描 impl 块中的所有方法，识别 `#[get_mapping]`、`#[post_mapping]` 等路由宏（只起标记作用，不移除）。
 /// 3. 被 mapping 标记的方法：
-///    - 返回值自动用 `Json<T>` 包裹。
-///    - 原方法中的 Axum 提取器参数重写为裸类型（如 `Path(id): Path<i64>`  `id: i64`）。
+///    - 原方法中的 Axum 提取器参数重写为裸类型（如 `Path(id): Path<i64>` → `id: i64`）。
 ///    - 生成对应的 Axum 路由 handler，参数原原本本保留提取器形式。
-///    - handler 返回值同样声明为 `Json<T>`。
+///    - 原方法本身保持原样，返回值由生成的 handler 自动用 `Json<T>` 包裹。
 /// 4. 未被 mapping 标记的方法保持原样，不做任何修改。
 pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> TokenStream {
     // 1. 解析基础路径
@@ -71,7 +71,7 @@ pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> To
                 }
             }
 
-            // 被 mapping 标记的方法：参数重写 + Json 包裹 + 生成 handler
+            // 被 mapping 标记的方法：参数重写 + 生成 handler（返回值在 handler 中自动包裹为 Json）
             if let Some((http_method, method_path)) = route_info {
                 // 记录原始参数（用于生成 handler）
                 let original_inputs = method.sig.inputs.clone();
@@ -79,8 +79,6 @@ pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> To
                 // 提取器参数重写为裸类型
                 rewrite_method_params(method);
 
-                // 返回值 Json 化
-                wrap_method_return_with_json(method);
                 let full_path = combine_paths(&base_path, &method_path);
                 let handler_fn_name = Ident::new(
                     &format!("{}_{}", struct_snake_name, method_name),
@@ -126,15 +124,18 @@ pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> To
                     }
                 }
 
-                // 获取返回类型（已经被 Json 化）
-                let output = method.sig.output.clone();
+                // 获取原始返回类型，用于在 handler 中包裹为 Json
+                let original_ret_ty = match &method.sig.output {
+                    syn::ReturnType::Default => quote!(()),
+                    syn::ReturnType::Type(_, ty) => quote!(#ty),
+                };
 
                 // 生成路由方法
                 let router_method = match http_method {
-                    "get" => quote! { simple_starter_web::axum::routing::get },
-                    "post" => quote! { simple_starter_web::axum::routing::post },
-                    "put" => quote! { simple_starter_web::axum::routing::put },
-                    "delete" => quote! { simple_starter_web::axum::routing::delete },
+                    "get" => quote! { ::simple_starter_web::axum::routing::get },
+                    "post" => quote! { ::simple_starter_web::axum::routing::post },
+                    "put" => quote! { ::simple_starter_web::axum::routing::put },
+                    "delete" => quote! { ::simple_starter_web::axum::routing::delete },
                     _ => unreachable!(),
                 };
 
@@ -142,18 +143,18 @@ pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> To
                 let handler_fn = if param_exprs.is_empty() {
                     quote! {
                         async fn #handler_fn_name(
-                            simple_starter_web::axum::extract::State(controller): simple_starter_web::axum::extract::State<std::sync::Arc<#controller_type>>
-                        ) #output {
-                            controller.#method_name().await
+                            ::simple_starter_web::axum::extract::State(controller): ::simple_starter_web::axum::extract::State<std::sync::Arc<#controller_type>>
+                        ) -> ::simple_starter_web::axum::Json<#original_ret_ty> {
+                            ::simple_starter_web::axum::Json(controller.#method_name().await)
                         }
                     }
                 } else {
                     quote! {
                         async fn #handler_fn_name(
-                            simple_starter_web::axum::extract::State(controller): simple_starter_web::axum::extract::State<std::sync::Arc<#controller_type>>,
+                            ::simple_starter_web::axum::extract::State(controller): ::simple_starter_web::axum::extract::State<std::sync::Arc<#controller_type>>,
                             #(#axum_params),*
-                        ) #output {
-                            controller.#method_name(#(#param_exprs),*).await
+                        ) -> ::simple_starter_web::axum::Json<#original_ret_ty> {
+                            ::simple_starter_web::axum::Json(controller.#method_name(#(#param_exprs),*).await)
                         }
                     }
                 };
@@ -162,10 +163,10 @@ pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> To
                 let route_registration = quote! {
                     #handler_fn
 
-                    simple_starter_web::submit!(
-                        simple_starter_web::RouteFactory {
+                    ::simple_starter_web::submit!(
+                        ::simple_starter_web::RouteFactory {
                             router: || {
-                                simple_starter_web::axum::Router::new()
+                                ::simple_starter_web::axum::Router::new()
                                     .route(#full_path, #router_method(#handler_fn_name))
                                     .with_state(
                                         simple_starter_core::AppCoreUtil::get_component::<#controller_type>()
@@ -213,22 +214,6 @@ fn parse_mapping_path(attr: &syn::Attribute) -> String {
         "/".to_string()
     } else {
         path
-    }
-}
-
-/// 组合基础路径和方法路径
-fn combine_paths(base: &str, method: &str) -> String {
-    let base = base.trim_matches('/');
-    let method = method.trim_matches('/');
-
-    if base.is_empty() && method.is_empty() {
-        "/".to_string()
-    } else if base.is_empty() {
-        format!("/{}", method)
-    } else if method.is_empty() {
-        format!("/{}", base)
-    } else {
-        format!("/{}/{}", base, method)
     }
 }
 
@@ -305,28 +290,7 @@ fn rewrite_method_params(method: &mut syn::ImplItemFn) {
     }
 }
 
-/// 将方法的返回值包装为 Json<T>。
-/// 参考 json_response_macro 的实现：返回类型改为 Json<T>，方法体结果用 Json() 包裹。
-fn wrap_method_return_with_json(method: &mut syn::ImplItemFn) {
-    let original_ret_ty = match &method.sig.output {
-        syn::ReturnType::Default => quote!(()),
-        syn::ReturnType::Type(_, ty) => quote!(#ty),
-    };
 
-    // 修改返回类型为 Json<原始类型>
-    method.sig.output = syn::parse2(quote! {
-        -> simple_starter_web::axum::Json<#original_ret_ty>
-    }).unwrap_or_else(|_| method.sig.output.clone());
-
-    // 修改方法体
-    let stmts = &method.block.stmts;
-    method.block = syn::parse2(quote! {
-        {
-            let __result = async { #(#stmts)* }.await;
-            simple_starter_web::axum::Json(__result)
-        }
-    }).unwrap_or_else(|_| method.block.clone());
-}
 
 /// 从类型中提取结构体名，并转为 snake_case。
 /// 例如 `TestController` -> `test_controller`

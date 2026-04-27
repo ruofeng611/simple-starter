@@ -39,6 +39,9 @@ mod utils {
 /// 应用程序主入口逻辑
 mod application;
 
+/// 扩展存储（AnyMap）
+mod extensions;
+
 /// 全局静态状态管理（配置单例、组件仓库）
 mod global_state;
 
@@ -52,7 +55,7 @@ pub use tracing; // 用于日志记录 (info!, error!, debug! 等)
 
 // 2. 核心入口与工具
 pub use application::Application; // 应用程序启动入口
-pub use utils::app_core_util::AppCoreUtil; // 获取配置、获取组件等核心工具
+pub use utils::app_core_util::{AppCoreUtil, ComponentOrder}; // 获取配置、获取组件等核心工具
 
 // 3. 组件与插件系统
 pub use core::app_component::ComponentProcessorFactory; // 组件工厂（宏生成使用）

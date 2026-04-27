@@ -77,10 +77,10 @@ pub(crate) fn route_macro(method: &str, args: TokenStream, input: TokenStream) -
 
     // 3. 映射 HTTP 方法到 axum 的路由构建函数
     let router_method = match method {
-        "get" => quote! { simple_starter_web::axum::routing::get },
-        "post" => quote! { simple_starter_web::axum::routing::post },
-        "put" => quote! { simple_starter_web::axum::routing::put },
-        "delete" => quote! { simple_starter_web::axum::routing::delete },
+        "get" => quote! { ::simple_starter_web::axum::routing::get },
+        "post" => quote! { ::simple_starter_web::axum::routing::post },
+        "put" => quote! { ::simple_starter_web::axum::routing::put },
+        "delete" => quote! { ::simple_starter_web::axum::routing::delete },
         _ => {
             return syn::Error::new_spanned(
                 &input_fn,
@@ -96,14 +96,14 @@ pub(crate) fn route_macro(method: &str, args: TokenStream, input: TokenStream) -
     let router_build = if let Some(state) = state_expr {
         // 带有 .with_state(...)
         quote! {
-            simple_starter_web::axum::Router::new()
+            ::simple_starter_web::axum::Router::new()
                 .route(#path, #router_method(#func_name))
                 .with_state(#state)
         }
     } else {
         // 无状态
         quote! {
-            simple_starter_web::axum::Router::new()
+            ::simple_starter_web::axum::Router::new()
                 .route(#path, #router_method(#func_name))
         }
     };
@@ -113,8 +113,8 @@ pub(crate) fn route_macro(method: &str, args: TokenStream, input: TokenStream) -
     // - 使用 submit! 宏注册 RouteFactory
     let expanded = quote! {
         #input_fn
-        simple_starter_web::submit!(
-            simple_starter_web::RouteFactory {
+        ::simple_starter_web::submit!(
+            ::simple_starter_web::RouteFactory {
                 router: || { #router_build },
             }
         );

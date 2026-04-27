@@ -2,6 +2,7 @@ use crate::core::app_config::{AppConfig, LoggerConfig, RuntimeConfig};
 use crate::core::app_job::CronJob;
 use crate::core::app_plugin::Plugin;
 use crate::core::app_types::TaskSpawnsFactory;
+use crate::extensions::Extensions;
 use crate::global_state::COMPONENT_REPOSITORY;
 use crate::loaders::component_loader::{component_repository_load, shutdown_components};
 use crate::loaders::config_loader::global_config_load;
@@ -59,6 +60,9 @@ pub struct Application {
 
     /// 日志守卫 (必须持有以保证异步日志不丢失)
     log_guard: Option<WorkerGuard>,
+
+    /// 扩展存储容器（AnyMap），供插件挂载自定义数据
+    extensions: Extensions,
 }
 
 impl Application {
@@ -80,6 +84,8 @@ impl Application {
             tokio_runtime: None,
 
             log_guard: None,
+
+            extensions: Extensions::new(),
         }
     }
 
@@ -101,6 +107,33 @@ impl Application {
     /// 将 Tokio 运行时放到内部
     pub fn set_runtime(&mut self, runtime: tokio::runtime::Runtime) {
         self.tokio_runtime = Some(runtime);
+    }
+
+    /// 插入一个扩展值。
+    ///
+    /// 如果同类型已存在，返回旧值。
+    pub fn insert_extension<T: std::any::Any + Send>(&mut self, val: T) -> Option<T> {
+        self.extensions.insert(val)
+    }
+
+    /// 获取不可变的扩展引用。
+    pub fn get_extension<T: std::any::Any + Send>(&self) -> Option<&T> {
+        self.extensions.get::<T>()
+    }
+
+    /// 获取可变的扩展引用。
+    pub fn get_extension_mut<T: std::any::Any + Send>(&mut self) -> Option<&mut T> {
+        self.extensions.get_mut::<T>()
+    }
+
+    /// 移除并返回指定类型的扩展值。
+    pub fn remove_extension<T: std::any::Any + Send>(&mut self) -> Option<T> {
+        self.extensions.remove::<T>()
+    }
+
+    /// 检查是否包含指定类型的扩展。
+    pub fn contains_extension<T: std::any::Any + Send>(&self) -> bool {
+        self.extensions.contains::<T>()
     }
 
     /// 设置自定义的 Tokio 运行时的创建工厂
@@ -539,17 +572,26 @@ impl Application {
         Ok(())
     }
 
-    /// 初始化插件列表
-    fn init_plugins(&mut self) -> anyhow::Result<()> {
+    /// 启动方法，引导阶段：插件排序 → 插件 init → 组件加载 → 插件 post_init → 启动钩子
+    fn start(&mut self) -> anyhow::Result<()> {
+        // 1. 插件排序（同步）
+        if !self.plugins.is_empty() {
+            self.sort_plugins_by_dependency()?;
+        }
+
+        // 2. 判断是否有 inventory 组件
+        let has_inventory_components = inventory::iter::<ComponentProcessorFactory>
+            .into_iter()
+            .next()
+            .is_some();
+
         let mut plugins = std::mem::take(&mut self.plugins);
-
-        // 把 runtime 临时移出 self
+        let mut startup_hooks = std::mem::take(&mut self.startup_hooks);
         let rt = self.tokio_runtime.take().unwrap();
-
-        // 这里的技巧是传入 &mut *self 来绕过借用检查
         let app = &mut *self;
 
         let result = rt.block_on(async move {
+            // 2.1 插件 init
             for plugin in plugins.iter_mut() {
                 match plugin.init(app).await {
                     Ok(_) => {
@@ -562,7 +604,42 @@ impl Application {
                     }
                 }
             }
-            // 初始化成功后，必须把 plugins 返回出来，否则它就被丢弃了
+
+            // 2.2 组件加载 (Inventory 模式)
+            if has_inventory_components {
+                if let Err(e) = component_repository_load().await {
+                    return Err(anyhow!("Component repository load failed: {:?}", e));
+                }
+            }
+
+            // 2.3 插件 post_init
+            for plugin in plugins.iter_mut() {
+                match plugin.post_init(app).await {
+                    Ok(_) => {
+                        if plugin.should_log() {
+                            info!("Plugin post-initialized: [{}]", plugin.name());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Plugin '{}' post_init failed: {:?}",
+                            plugin.name(),
+                            e
+                        ));
+                    }
+                }
+            }
+
+            // 2.4 启动钩子
+            if !startup_hooks.is_empty() {
+                for hook in startup_hooks.drain(..) {
+                    if let Err(e) = hook.await {
+                        return Err(anyhow!("Startup hook failed: {:?}", e));
+                    }
+                }
+                info!("All startup hooks executed");
+            }
+
             Ok(plugins)
         });
 
@@ -571,50 +648,12 @@ impl Application {
 
         match result {
             Ok(p) => {
-                // 将初始化好的插件放回 self
+                // 把插件放回去
                 self.plugins = p;
                 Ok(())
             }
             Err(e) => Err(e),
         }
-    }
-
-    /// 启动方法，加载相关组件仓库、插件、执行启动钩子
-    fn start(&mut self) -> anyhow::Result<()> {
-        // 1. 加载组件仓库 (Inventory 模式)
-        if inventory::iter::<ComponentProcessorFactory>
-            .into_iter()
-            .next()
-            .is_some()
-        {
-            let rt = self.tokio_runtime.as_ref().unwrap();
-            rt.block_on(component_repository_load())?;
-        }
-
-        // 2. 初始化插件
-        if !self.plugins.is_empty() {
-            // 2.1 插件排序 (依赖检查)
-            self.sort_plugins_by_dependency()?;
-            // 2.2 插件初始化
-            self.init_plugins()?;
-        }
-
-        // 3. 执行启动钩子
-        if !self.startup_hooks.is_empty() {
-            let mut startup_hooks = std::mem::take(&mut self.startup_hooks);
-            let rt = self.tokio_runtime.as_ref().unwrap();
-            rt.block_on(async move {
-                for hook in startup_hooks.drain(..) {
-                    if let Err(e) = hook.await {
-                        return Err(anyhow!("Startup hook failed: {:?}", e));
-                    }
-                }
-                Ok(())
-            })?;
-            info!("All startup hooks executed");
-        }
-
-        Ok(())
     }
 
     /// 关闭流程, 关闭流程中出现错误只打印错误不退出程序, 让每个关闭函数都能执行

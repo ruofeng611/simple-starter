@@ -1,6 +1,6 @@
 [package]
 name = "simple-starter-web"
-version = "1.3.1"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
@@ -13,3 +13,4 @@ tower-http = { workspace = true }
 inventory = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
+tokio-util = { workspace = true }

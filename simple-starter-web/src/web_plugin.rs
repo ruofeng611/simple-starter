@@ -1,19 +1,23 @@
-use crate::RouteFactory;
 use crate::config::web_config::WebConfig;
+use crate::web_extension::WebExtensionRegistry;
 use async_trait::async_trait;
 use axum::Router;
 use simple_starter_core::anyhow::Context;
-use simple_starter_core::tracing::{Level, info};
 use simple_starter_core::{AppCoreUtil, Application, Plugin};
-use std::net::SocketAddr;
 use toml::Value;
-use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 
 /// Web 插件结构
 ///
 /// 负责集成 Axum Web 框架，自动发现并注册路由，启动 HTTP 服务。
+///
+/// # 两阶段初始化
+///
+/// - `init`: 创建 `WebExtensionRegistry` 并放入 `Application` 扩展上下文，
+///   供其他依赖 WebPlugin 的插件注册中间件、路由修改器等扩展。
+/// - `post_init`: 在所有插件的 `init` 执行完毕后，消费注册表并构建/启动服务。
 pub struct WebPlugin {
     manual_router_factory: Vec<Box<dyn FnOnce() -> Router + Send>>,
+    registry: WebExtensionRegistry,
 }
 
 impl WebPlugin {
@@ -21,6 +25,7 @@ impl WebPlugin {
     pub fn new() -> Self {
         WebPlugin {
             manual_router_factory: Vec::new(),
+            registry: WebExtensionRegistry::new(),
         }
     }
 
@@ -32,6 +37,49 @@ impl WebPlugin {
         F: FnOnce() -> Router + Send + 'static,
     {
         self.manual_router_factory.push(Box::new(factory));
+        self
+    }
+
+    /// 添加路由修改器（用户自定义扩展）
+    ///
+    /// 在 `WebPlugin::new()` 阶段即可注册，与其他插件通过 `Application` 上下文注册的效果相同。
+    pub fn add_router_modifier<F>(mut self, modifier: F) -> Self
+    where
+        F: FnOnce(Router) -> Router + Send + 'static,
+    {
+        self.registry.add_router_modifier(modifier);
+        self
+    }
+
+    /// 添加中间件（用户自定义扩展）
+    ///
+    /// 在 `WebPlugin::new()` 阶段即可注册，与其他插件通过 `Application` 上下文注册的效果相同。
+    pub fn add_middleware<F>(mut self, applier: F) -> Self
+    where
+        F: FnOnce(Router) -> Router + Send + 'static,
+    {
+        self.registry.add_middleware(applier);
+        self
+    }
+
+    /// 设置自定义监听器工厂（用户自定义扩展）
+    ///
+    /// 典型用途：实现 TLS/HTTPS、Unix Domain Socket 等。
+    /// 设置后建议同时调用 `set_server_scheme("https")` 以修正日志输出。
+    pub fn set_listener_factory<F, Fut>(mut self, factory: F) -> Self
+    where
+        F: FnOnce(&str, u16) -> Fut + Send + 'static,
+        Fut: Future<Output = simple_starter_core::anyhow::Result<tokio::net::TcpListener>> + Send + 'static,
+    {
+        self.registry.set_listener_factory(factory);
+        self
+    }
+
+    /// 设置服务协议前缀（影响启动日志）
+    ///
+    /// 默认值为 `"http"`，若启用了 TLS，建议设置为 `"https"`。
+    pub fn set_server_scheme(mut self, scheme: impl Into<String>) -> Self {
+        self.registry.set_server_scheme(scheme);
         self
     }
 }
@@ -52,81 +100,46 @@ impl Plugin for WebPlugin {
         Value::Table(table)
     }
 
-    /// 插件初始化逻辑
+    /// 初始化阶段
     ///
-    /// 包括配置加载、路由组装、中间件应用以及后台服务任务的启动。
+    /// 将 `WebPlugin` 自身的 `WebExtensionRegistry` 移入 `Application` 扩展上下文，
+    /// 供其他依赖 WebPlugin 的插件继续注册扩展。
     async fn init(&mut self, ctx: &mut Application) -> simple_starter_core::anyhow::Result<()> {
+        let registry = std::mem::take(&mut self.registry);
+        ctx.insert_extension(registry);
+        Ok(())
+    }
+
+    /// 后置初始化阶段
+    ///
+    /// 此时所有插件的 `init` 已完成，扩展注册表已被填充（包含用户在 `new()` 阶段
+    /// 注册的扩展以及其他插件通过 `Application` 上下文注册的扩展）。
+    /// 消费注册表、构建 Router、注册后台任务。
+    async fn post_init(
+        &mut self,
+        ctx: &mut Application,
+    ) -> simple_starter_core::anyhow::Result<()> {
         // 1. 加载 Web 配置
         let web_config: WebConfig = AppCoreUtil::get_config_to_struct::<WebConfig>("web")
             .context("Failed to load 'web' config section")?;
 
-        // 2. 构建主路由
-        let mut main_router = Router::new();
-        // 遍历自动收集到的路由工厂，逐个构建并合并
-        for route_factory in inventory::iter::<RouteFactory> {
-            let router = (route_factory.router)();
-            main_router = main_router.merge(router);
-        }
-        // 添加手动注册的路由
+        // 2. 取出手动注册的路由工厂
         let manual_router_factory = std::mem::take(&mut self.manual_router_factory);
-        for router_factory in manual_router_factory {
-            main_router = main_router.merge(router_factory());
-        }
 
-        // 3. 应用 base_path 前缀（如果配置了）
-        let mut app_router = if let Some(ref base) = web_config.base_path {
-            info!("Mounting routes under base path: {}", base);
-            Router::new().nest(base, main_router)
-        } else {
-            main_router
-        };
+        // 3. 从应用上下文中消费扩展注册表
+        let registry = ctx
+            .remove_extension::<WebExtensionRegistry>()
+            .context("WebExtensionRegistry not found in application context")?;
 
-        // 4. 配置并添加日志追踪中间件
-        let log_level: Level = AppCoreUtil::get_config_value_by_path("logger.level")
-            .context("Failed to load 'logger.level' config")?
-            .as_str()
-            .context("Failed to parse log level as string")?
-            .parse()
-            .context("Invalid log level format")?;
-
-        app_router = app_router.layer(
-            TraceLayer::new_for_http()
-                .make_span_with(
-                    DefaultMakeSpan::new().include_headers(web_config.log_include_headers),
-                )
-                .on_request(DefaultOnRequest::new().level(log_level))
-                .on_response(DefaultOnResponse::new().level(log_level)),
-        );
-
-        // 5. 构建监听地址
-        let addr: SocketAddr = format!("{}:{}", web_config.binding, web_config.port)
-            .parse()
-            .with_context(|| {
-                format!(
-                    "Invalid host:port configuration: {}:{}",
-                    web_config.binding, web_config.port
-                )
-            })?;
-
-        // 6. 将 Web 服务注册为应用的后台任务
+        // 4. 注册延迟构建的后台任务
         ctx.add_task_spawn_factory_in_context(move |cancel_token| async move {
-            let listener = tokio::net::TcpListener::bind(&addr)
-                .await
-                .context("Failed to bind TCP listener")?;
-
-            info!("Server listening on http://{}", addr);
-
-            // 启动 Axum 服务，并绑定优雅退出信号
-            axum::serve(listener, app_router)
-                .with_graceful_shutdown(async move {
-                    // 等待取消令牌被触发
-                    cancel_token.cancelled().await;
-                    info!("Web server received shutdown signal.");
-                })
-                .await
-                .context("Web server execution failed")?;
-
-            Ok(())
+            crate::server_builder::build_and_serve(
+                web_config,
+                manual_router_factory,
+                registry,
+                cancel_token,
+            )
+            .await
         });
 
         Ok(())

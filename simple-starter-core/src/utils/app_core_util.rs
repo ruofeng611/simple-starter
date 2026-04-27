@@ -9,6 +9,24 @@ use std::any::{Any, TypeId};
 use std::sync::Arc;
 use toml::Value;
 
+/// 动态注册组件时的顺序策略
+///
+/// 控制组件在启动顺序列表中的位置，从而影响创建/初始化顺序和销毁顺序。
+pub enum ComponentOrder {
+    /// 头插入：先创建、先初始化、后销毁。
+    /// 适用于基础设施组件（如 HttpTemplate），它们不依赖其他组件，但可能被其他组件依赖。
+    Front,
+    /// 尾插入：后创建、后初始化、先销毁。
+    /// 适用于普通组件或依赖已有组件的动态注册组件。
+    Back,
+}
+
+impl Default for ComponentOrder {
+    fn default() -> Self {
+        ComponentOrder::Back
+    }
+}
+
 pub struct AppCoreUtil;
 
 impl AppCoreUtil {
@@ -60,6 +78,7 @@ impl AppCoreUtil {
     pub fn register_component<T, F, Fut>(
         component: T,
         destroy_fn: Option<F>,
+        order: ComponentOrder,
     ) -> Result<(), ComponentError>
     where
         T: Any + Send + Sync + 'static,
@@ -67,7 +86,7 @@ impl AppCoreUtil {
         Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
         let name = get_short_type_name::<T>();
-        Self::register_component_with_name(component, name, destroy_fn)
+        Self::register_component_with_name(component, name, destroy_fn, order)
     }
 
     /// 动态注册组件（指定名称）
@@ -77,6 +96,7 @@ impl AppCoreUtil {
         component: T,
         name: S,
         destroy_fn: Option<F>,
+        order: ComponentOrder,
     ) -> Result<(), ComponentError>
     where
         T: Any + Send + Sync + 'static,
@@ -120,7 +140,10 @@ impl AppCoreUtil {
                     .map_err(|_| ComponentError::InternalError {
                         message: "Failed to lock component order".to_string(),
                     })?;
-            order_guard.push(key);
+            match order {
+                ComponentOrder::Front => order_guard.insert(0, key),
+                ComponentOrder::Back => order_guard.push(key),
+            }
         }
 
         Ok(())

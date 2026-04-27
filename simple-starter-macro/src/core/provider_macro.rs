@@ -89,14 +89,14 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                     // 按名称获取
                     dependencies_names.push(name.clone());
                     arg_preparations.push(quote! {
-                        let #arg_var_name = simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?;
+                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?;
                     });
                 } else {
                     // 按类型获取
                     let short_name = get_short_type_name_from_type(inner_type);
                     dependencies_names.push(short_name);
                     arg_preparations.push(quote! {
-                        let #arg_var_name = simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?;
+                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?;
                     });
                 }
 
@@ -110,7 +110,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
 
     // Create Fn: 包装原函数调用
     let create_fn_impl = quote! {
-        Box::new(move || -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<#component_type>> {
+        Box::new(move || -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#component_type>> {
             Box::pin(async move {
                 // 先准备所有参数
                 #(#arg_preparations)*
@@ -124,7 +124,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
     // Destroy Fn: 处理销毁逻辑
     let destroy_fn_impl = if let Some(expr) = destroy_method {
         quote! {
-            Some(Box::new(|c: #component_type| -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<()>> {
+            Some(Box::new(|c: #component_type| -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<()>> {
                 Box::pin(async move {
                     // 调用用户提供的销毁表达式 (可以是函数名或闭包)
                     let _ = (#expr)(c).await?;
@@ -138,13 +138,13 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
 
     // 5. 生成 Inventory 注册代码
     let inventory_impl = quote! {
-        simple_starter_core::submit! {
-            simple_starter_core::ComponentProcessorFactory {
+        ::simple_starter_core::submit! {
+            ::simple_starter_core::ComponentProcessorFactory {
                 dependencies: &[#(#dependencies_names),*],
                 name: #final_component_name,
                 type_id: std::any::TypeId::of::<#component_type>(),
                 constructor: || {
-                    let wrapper = simple_starter_core::ComponentWrapper::<#component_type>::new(
+                    let wrapper = ::simple_starter_core::ComponentWrapper::<#component_type>::new(
                         #create_fn_impl,
                         None, // Provider 模式下 Init 逻辑通常包含在 create 中
                         #destroy_fn_impl

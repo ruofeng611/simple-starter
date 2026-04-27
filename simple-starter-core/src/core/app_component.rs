@@ -63,9 +63,11 @@ impl<T: Any + Send + Sync> ComponentWrapper<T> {
 impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
     async fn create(&mut self) -> anyhow::Result<()> {
         // 执行用户提供的创建函数，生成实例
-        let instance = self.create_fn.take().unwrap()().await?;
-        // 将实例封装在 Arc 中，允许共享所有权
-        self.inner = Some(Arc::new(instance));
+        if let Some(create_fn) = self.create_fn.take() {
+            let instance = create_fn().await?;
+            // 将实例封装在 Arc 中，允许共享所有权
+            self.inner = Some(Arc::new(instance));
+        }
         Ok(())
     }
 

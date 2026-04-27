@@ -2,7 +2,7 @@
 members = [
     "simple-starter-macro",
     "simple-starter-core",
-    "simple-starter-web",
+    "simple-starter-web", "simple-starter-security",
 ]
 
 resolver = "2"

@@ -103,3 +103,21 @@ pub(crate) fn parse_and_strip_inject(attrs: &mut Vec<Attribute>) -> (bool, Optio
 
     (is_injected, inject_name)
 }
+
+/// 组合基础路径和方法路径。
+///
+/// 用于 `rest_controller` 和 `security_controller` 宏中拼接完整路由路径。
+pub(crate) fn combine_paths(base: &str, method: &str) -> String {
+    let base = base.trim_matches('/');
+    let method = method.trim_matches('/');
+
+    if base.is_empty() && method.is_empty() {
+        "/".to_string()
+    } else if base.is_empty() {
+        format!("/{}", method)
+    } else if method.is_empty() {
+        format!("/{}", base)
+    } else {
+        format!("/{}/{}", base, method)
+    }
+}

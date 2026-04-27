@@ -27,10 +27,10 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
     // 逻辑：调用 AppCoreUtil::get_config_to_struct 读取配置
     // 注意：这要求目标结构体必须实现了 serde::Deserialize
     let create_fn_impl = quote! {
-        Box::new(move || -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<#struct_name>> {
+        Box::new(move || -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#struct_name>> {
             Box::pin(async move {
                 // 尝试从配置路径加载
-                let config = simple_starter_core::AppCoreUtil::get_config_to_struct::<#struct_name>(#prefix)?;
+                let config = ::simple_starter_core::AppCoreUtil::get_config_to_struct::<#struct_name>(#prefix)?;
                 Ok(config)
             })
         })
@@ -39,14 +39,14 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
     // 4. 生成 Inventory 注册代码
     // 配置组件没有其他组件依赖，也没有 init/destroy 方法
     let inventory_impl = quote! {
-        simple_starter_core::submit! {
-            simple_starter_core::ComponentProcessorFactory {
+        ::simple_starter_core::submit! {
+            ::simple_starter_core::ComponentProcessorFactory {
                 // 配置对象不需要依赖注入其他组件，所以依赖列表为空
                 dependencies: &[],
                 name: #final_component_name,
                 type_id: std::any::TypeId::of::<#struct_name>(),
                 constructor: || {
-                    let wrapper = simple_starter_core::ComponentWrapper::<#struct_name>::new(
+                    let wrapper = ::simple_starter_core::ComponentWrapper::<#struct_name>::new(
                         #create_fn_impl,
                         None, // 无初始化方法
                         None  // 无销毁方法

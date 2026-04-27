@@ -1,0 +1,12 @@
+[package]
+name = "simple-starter-security"
+version = "1.0.0"
+edition = "2024"
+
+[dependencies]
+simple-starter-core = { path = "../simple-starter-core" }
+simple-starter-web = { path = "../simple-starter-web" }
+serde_json = { workspace = true }
+inventory = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }

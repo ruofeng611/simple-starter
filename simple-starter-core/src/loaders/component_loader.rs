@@ -67,12 +67,12 @@ fn register_components() -> anyhow::Result<()> {
     // 6. 计算启动顺序 (拓扑排序)
     let sorted_keys = resolve_component_order(&dependency_map)?;
 
-    // 7. 保存顺序到全局变量
+    // 7. 追加顺序到全局变量（保留已有的动态注册组件顺序）
     {
         let mut order_guard = COMPONENT_ORDER
             .lock()
             .map_err(|_| anyhow::anyhow!("Failed to lock COMPONENT_ORDER (Poisoned)"))?;
-        *order_guard = sorted_keys;
+        order_guard.extend(sorted_keys);
     }
 
     Ok(())

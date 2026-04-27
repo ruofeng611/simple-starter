@@ -64,7 +64,7 @@ pub(crate) fn component_macro(args: TokenStream, input: TokenStream) -> TokenStr
                         // 按名称获取
                         dependencies_names.push(name.clone());
                         quote! {
-                             simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?
+                             ::simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?
                         }
                     } else {
                         // 按类型获取
@@ -73,7 +73,7 @@ pub(crate) fn component_macro(args: TokenStream, input: TokenStream) -> TokenStr
                         dependencies_names.push(short_type_name);
 
                         quote! {
-                             simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?
+                             ::simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?
                         }
                     };
 
@@ -106,7 +106,7 @@ pub(crate) fn component_macro(args: TokenStream, input: TokenStream) -> TokenStr
     // 生成构造函数 (Constructor)
     // 返回一个 BoxFuture，内部创建结构体实例
     let create_fn_impl = quote! {
-        Box::new(move || -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<#struct_name>> {
+        Box::new(move || -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#struct_name>> {
             Box::pin(async move {
                 let instance = #struct_name {
                     #(#field_injections),*
@@ -120,7 +120,7 @@ pub(crate) fn component_macro(args: TokenStream, input: TokenStream) -> TokenStr
     let init_fn_impl = if let Some(method) = init_method {
         let method_ident = Ident::new(&method, Span::call_site());
         quote! {
-            Some(Box::new(|c: std::sync::Arc<#struct_name>| -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<()>> {
+            Some(Box::new(|c: std::sync::Arc<#struct_name>| -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<()>> {
                 Box::pin(async move {
                     let _ = c.#method_ident().await?;
                     Ok(())
@@ -135,7 +135,7 @@ pub(crate) fn component_macro(args: TokenStream, input: TokenStream) -> TokenStr
     let destroy_fn_impl = if let Some(method) = destroy_method {
         let method_ident = Ident::new(&method, Span::call_site());
         quote! {
-            Some(Box::new(|c: #struct_name| -> simple_starter_core::BoxFuture<simple_starter_core::anyhow::Result<()>> {
+            Some(Box::new(|c: #struct_name| -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<()>> {
                 Box::pin(async move {
                     let _ = c.#method_ident().await?;
                     Ok(())
@@ -149,13 +149,13 @@ pub(crate) fn component_macro(args: TokenStream, input: TokenStream) -> TokenStr
     // 4. 生成 Inventory 注册代码
     // 将元数据注册到全局注册表中
     let inventory_impl = quote! {
-        simple_starter_core::submit! {
-            simple_starter_core::ComponentProcessorFactory {
+        ::simple_starter_core::submit! {
+            ::simple_starter_core::ComponentProcessorFactory {
                 dependencies: &[#(#dependencies_names),*],
                 name: #final_component_name,
                 type_id: std::any::TypeId::of::<#struct_name>(),
                 constructor: || {
-                    let wrapper = simple_starter_core::ComponentWrapper::<#struct_name>::new(
+                    let wrapper = ::simple_starter_core::ComponentWrapper::<#struct_name>::new(
                         #create_fn_impl,
                         #init_fn_impl,
                         #destroy_fn_impl

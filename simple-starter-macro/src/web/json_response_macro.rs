@@ -47,11 +47,11 @@ pub(crate) fn json_response_macro(_args: TokenStream, input: TokenStream) -> Tok
     // 保持原有签名（可见性、参数），但修改返回类型为 Json<T>
     let expanded = quote! {
         #(#attrs)*
-        #vis async fn #func_name(#inputs) -> simple_starter_web::axum::Json<#original_ret_ty> {
+        #vis async fn #func_name(#inputs) -> ::simple_starter_web::axum::Json<#original_ret_ty> {
             // 在 async块中执行原逻辑
             let __result = async { #block }.await;
             // 自动包装
-            simple_starter_web::axum::Json(__result)
+            ::simple_starter_web::axum::Json(__result)
         }
     };
 
