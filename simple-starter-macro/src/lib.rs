@@ -2,6 +2,7 @@ mod core {
     pub(crate) mod component_macro;
     pub(crate) mod configuration_macro;
     pub(crate) mod cron_job_macro;
+    pub(crate) mod injectable_macro;
     pub(crate) mod provider_macro;
 }
 
@@ -43,6 +44,33 @@ use proc_macro::TokenStream;
 #[proc_macro_attribute]
 pub fn component(args: TokenStream, item: TokenStream) -> TokenStream {
     core::component_macro::component_macro(args, item)
+}
+
+/// 标记一个 trait 实现可用于 trait object 注入。
+///
+/// 将 `impl Trait for Type` 注册为 trait 的可注入实现，
+/// 允许其他组件通过 `Arc<dyn Trait>` 或 `Vec<Arc<dyn Trait>>` 注入该实现。
+///
+/// 用法：
+/// ```rust
+/// #[injectable]
+/// impl Greeter for HelloGreeter {
+///     fn greet(&self) -> String {
+///         "Hello!".into()
+///     }
+/// }
+/// ```
+///
+/// 注意：必须搭配 `#[component]` 标注的结构体使用。
+/// `#[injectable]` 仅注册 trait→type 映射，不注册组件本身。
+#[proc_macro_attribute]
+pub fn injectable(args: TokenStream, item: TokenStream) -> TokenStream {
+    let item_impl = match syn::parse2::<syn::ItemImpl>(item.into()) {
+        Ok(impl_block) => impl_block,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    core::injectable_macro::injectable_on_impl(args, item_impl)
+        .unwrap_or_else(|e| e.to_compile_error().into())
 }
 
 /// 定义一个组件提供者（Provider）。

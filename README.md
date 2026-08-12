@@ -9,6 +9,7 @@
 ## ✨ 主要特性
 
 *   **自动依赖注入**：通过 `#[component]` 和 `#[inject]` 宏实现组件的自动注册与装配，支持按类型或名称注入。
+*   **Trait Object 注入**：通过 `#[injectable]` 注册 trait 实现，支持 `Arc<dyn Trait>` 按 trait、按名称注入及 `Vec<Arc<dyn Trait>>` 收集全部实现，TypeId 直接匹配。
 *   **智能生命周期管理**：自动计算组件依赖拓扑结构，按正确顺序执行 `create` -> `init`，并在退出时逆序 `destroy`。
 *   **分布式路由**：Web 路由（Axum）分散在各个模块中定义，启动时自动收集聚合，无需在 `main` 中手动挂载。
 *   **声明式定时任务**：通过 `#[cron_job]` 宏直接在函数上定义定时任务。
@@ -403,6 +404,12 @@ Rust 在编译期无法反射获取所有类型。本库利用 `inventory` crate
     *   `Ok(data)` -> `{ code: 200, message: "...", data: ... }`
     *   `Err(e)` -> 自动捕获错误堆栈日志，并返回 `{ code: 500, message: "服务器错误" }` (可自定义错误码)。
 
+### 5. Trait Object 注入 (Trait Object DI)
+*   **实现注册**：`#[injectable]` 作用于 `impl Trait for Type`，生成 `TraitImplRegistration`（trait TypeId + 实现 TypeId + 类型擦除 accessor）提交到 inventory。
+*   **依赖声明**：`#[inject]` 支持三种形式 —— `Arc<dyn Trait>`（按 trait 获取唯一实现）、`#[inject(name = "X")] Arc<dyn Trait>`（按名称获取）、`Vec<Arc<dyn Trait>>`（收集全部实现）。
+*   **排序解析**：trait 依赖以 `fn() -> TypeId` 函数指针声明，拓扑排序时通过 TypeId 直接展开为所有实现组件，无需字符串桥接（跨 crate 同名 trait 不冲突）。
+*   **运行时获取**：`AppCoreUtil::get_component_by_trait` / `get_component_by_trait_and_name` / `get_components_by_trait`，从 trait 对象缓存读取，不扫描组件仓库（避免 create 阶段死锁）。
+
 ---
 
 ## 📂 核心宏说明
@@ -413,6 +420,7 @@ Rust 在编译期无法反射获取所有类型。本库利用 `inventory` crate
 | `#[provider]`      | 将函数标记为组件工厂，用于创建复杂对象。                | `#[provider] async fn create_db() -> Database`   |
 | `#[configuration]` | 将结构体标记为配置组件，从全局配置文件中读取对应路径的数据进行反序列化 | `#[configuration("constant")]`                   |
 | `#[inject]`        | 标记字段需要注入依赖。                         | `#[inject] db: Arc<Database>`                    |
+| `#[injectable]`    | 注册 trait 与实现类的映射，支持 trait object 注入。   | `#[injectable] impl FileParser for JsonParser`   |
 | `#[cron_job]`      | 注册定时任务。                             | `#[cron_job("0 * * * * *")]`                     |
 | `#[get/post...]`   | 注册 HTTP 路由。                         | `#[get("/user")]`                                |
 | `#[json_response]` | 转换返回值为 Json 格式。                     | `async fn handler() -> JsonResponse`             |

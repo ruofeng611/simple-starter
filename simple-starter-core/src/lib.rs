@@ -62,9 +62,13 @@ pub use core::app_component::ComponentProcessorFactory; // 组件工厂（宏生
 pub use core::app_component::ComponentWrapper; // 组件包装器
 pub use core::app_plugin::Plugin; // 插件 Trait
 
-// 4. 任务系统
+// 4. Trait object 注入支持
+pub use core::app_component::Injectable; // 可注入 trait 的 supertrait
+pub use core::app_component::TraitImplRegistration; // trait 实现注册（宏生成使用）
+
+// 5. 任务系统
 pub use core::app_job::CronJob; // 定时任务结构
 
-// 5. 类型定义与错误扩展
+// 6. 类型定义与错误扩展
 pub use core::app_error::LogExpectExt; // 扩展 Result/Option 的 log_expect 方法
 pub use core::app_types::*; // 常用类型别名 (BoxFuture, ComponentKey 等)

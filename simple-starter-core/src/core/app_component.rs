@@ -2,6 +2,7 @@ use crate::core::app_types::{CreateFn, DestroyFn, InitFn};
 use async_trait::async_trait;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
+use crate::TraitObjAccessorFn;
 
 /// 组件处理器 Trait
 ///
@@ -19,20 +20,53 @@ pub trait ComponentProcessor: Any + Send + Sync {
 
     /// 用于类型转换
     fn as_any(&self) -> &dyn Any;
+
+    /// 获取组件实例的类型擦除引用
+    ///
+    /// 仅在 `create` 完成后才返回 `Some`。
+    /// 返回 `Arc<dyn Any + Send + Sync>`，可以 `downcast` 回具体类型。
+    fn get_inner_arc_any(&self) -> Option<Arc<dyn Any + Send + Sync>>;
 }
+
+/// 所有可注入 trait 的 supertrait
+///
+/// 要求 trait object 必须满足 `Any + Send + Sync`，
+/// 从而能够将 `Arc<dyn Trait>` 擦除为 `Arc<dyn Injectable>` 存入统一存储。
+/// 所有具体的 `'static` 类型自动实现此 trait。
+pub trait Injectable: Any + Send + Sync {}
+impl<T: Any + Send + Sync> Injectable for T {}
 
 /// 组件工厂结构体
 ///
 /// 用于 `inventory` 收集，存储组件的元数据和构造逻辑。
 pub struct ComponentProcessorFactory {
     pub dependencies: &'static [&'static str],
+    /// trait 依赖：编译期生成的函数指针，运行时返回依赖的 trait 的 TypeId
+    /// 用于拓扑排序中直接通过 TypeId 查找 trait 实现，无需字符串中转
+    pub trait_dependencies: &'static [fn() -> TypeId],
     pub name: &'static str,
     pub type_id: TypeId,
     pub constructor: fn() -> Box<dyn ComponentProcessor>,
 }
 
+/// 编译期 trait 实现注册结构体（供 `inventory` 收集）
+///
+/// 由 `#[component]` 在 `impl Trait for Struct` 上生成，
+/// 启动时被 `component_loader` 读入构建 trait 实现索引。
+pub struct TraitImplRegistration {
+    /// `TypeId::of::<dyn Trait>()`
+    pub trait_type_id: TypeId,
+    /// `TypeId::of::<ConcreteType>()`
+    pub impl_type_id: TypeId,
+    /// 类型转换函数：`Arc<ConcreteType> → Arc<dyn Injectable>`
+    pub accessor: TraitObjAccessorFn,
+}
+
 // 自动收集所有标记了 ComponentProcessorFactory 的静态变量
 inventory::collect!(ComponentProcessorFactory);
+
+// 自动收集所有标记了 TraitImplRegistration 的静态变量
+inventory::collect!(TraitImplRegistration);
 
 /// 组件包装器
 ///
@@ -105,5 +139,9 @@ impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn get_inner_arc_any(&self) -> Option<Arc<dyn Any + Send + Sync>> {
+        self.inner.as_ref().map(|arc| arc.clone() as Arc<dyn Any + Send + Sync>)
     }
 }

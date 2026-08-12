@@ -43,6 +43,7 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
             ::simple_starter_core::ComponentProcessorFactory {
                 // 配置对象不需要依赖注入其他组件，所以依赖列表为空
                 dependencies: &[],
+                trait_dependencies: &[],
                 name: #final_component_name,
                 type_id: std::any::TypeId::of::<#struct_name>(),
                 constructor: || {

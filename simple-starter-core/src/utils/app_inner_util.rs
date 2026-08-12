@@ -3,6 +3,9 @@ use std::fmt::Display;
 use std::hash::Hash;
 use toml::Value;
 
+use std::any::TypeId;
+use crate::global_state::COMPONENT_REPOSITORY;
+
 /// 深度合并 TOML 值
 ///
 /// 将 `overlay` 中的配置覆盖到 `base` 上。如果两者都是 Table，则递归合并。
@@ -34,6 +37,18 @@ pub(crate) fn get_short_type_name<T: ?Sized + 'static>() -> String {
         .last()
         .unwrap_or(full_name)
         .to_string()
+}
+
+/// 查找指定具体类型在 `COMPONENT_REPOSITORY` 中的所有实例名称。
+///
+/// 同一具体类型可能存在多个实例（如通过 provider 创建的同类型不同名称组件），
+/// 此函数返回该类型下所有已注册组件的实例名。
+pub(crate) fn find_instance_names_by_type(type_id: TypeId) -> Vec<String> {
+    COMPONENT_REPOSITORY
+        .iter()
+        .filter(|entry| entry.key().0 == type_id)
+        .map(|entry| entry.key().1.clone())
+        .collect()
 }
 
 /// 寻找图中的循环依赖路径

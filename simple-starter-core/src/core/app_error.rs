@@ -58,6 +58,15 @@ pub enum ComponentError {
 
     #[error("Internal error: {message}")]
     InternalError { message: String },
+
+    #[error("No implementation found for trait: {trait_name}")]
+    TraitImplNotFound { trait_name: String },
+
+    #[error("Ambiguous trait implementation for '{trait_name}': candidates = {candidates:?}")]
+    AmbiguousTraitImpl {
+        trait_name: String,
+        candidates: Vec<String>,
+    },
 }
 
 /// 配置加载相关的特定错误

@@ -4,6 +4,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{Layer, Registry};
+use crate::core::app_component::Injectable;
+
+/// trait object 访问器函数签名
+///
+/// 输入: `Arc<dyn Any + Send + Sync>`（组件实例的类型擦除形式）
+/// 输出: `Option<Arc<dyn Injectable>>`（通过 upcasting coercion 转换的 trait object）
+/// 由 `#[component]` on impl 块宏在编译期生成，已知具体类型和 trait，直接做类型转换。
+pub type TraitObjAccessorFn = fn(Arc<dyn std::any::Any + Send + Sync>) -> Option<Arc<dyn Injectable>>;
 
 /// 组件唯一标识符：由类型 ID 和 自定义名称组成
 pub type ComponentKey = (TypeId, String);

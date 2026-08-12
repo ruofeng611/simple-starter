@@ -1,13 +1,14 @@
 use crate::ComponentWrapper;
 use crate::core::app_error::{ComponentError, LogExpectExt, TomlConfigError};
 use crate::core::app_types::{ComponentKey, DestroyFn};
-use crate::global_state::{COMPONENT_REPOSITORY, GLOBAL_CONFIG};
+use crate::global_state::{COMPONENT_REPOSITORY, GLOBAL_CONFIG, INSTANCE_NAMES_BY_TRAIT, TRAIT_OBJ_CACHE};
 use crate::loaders::component_loader::COMPONENT_ORDER;
 use crate::utils::app_inner_util::get_short_type_name;
 use serde::Deserialize;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 use toml::Value;
+use crate::core::app_component::Injectable;
 
 /// 动态注册组件时的顺序策略
 ///
@@ -221,6 +222,119 @@ impl AppCoreUtil {
                         type_name: std::any::type_name::<T>().to_string(),
                         name: name.clone(),
                     });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    // =========================================================================
+    // Trait object 注入 API
+    // =========================================================================
+
+    /// 按 trait + name 获取组件 → `Arc<dyn Trait>`
+    ///
+    /// 从 `TRAIT_OBJ_CACHE` 中取出预计算好的裸指针，
+    /// 通过 `Arc::from_raw` 重建 `Arc<dyn Trait>`，
+    /// clone 后更新缓存中的指针。
+    ///
+    /// # Safety
+    ///
+    /// 内部使用 unsafe 将裸指针重建为 `Arc<dyn Trait>`。
+    /// 安全性由以下不变量保证：
+    /// - 指针由 `Arc::into_raw` 在 `populate_trait_obj_cache` 中创建
+    /// - 指针类型与 `Trait` 泛型参数匹配（由 `TraitImplRegistration` 的 trait_type_id 保证）
+    /// - 每次取出后 clone 一份，原指针放回缓存
+    pub fn get_component_by_trait_and_name<Trait: Injectable + ?Sized>(
+        name: &str,
+    ) -> Result<Arc<Trait>, ComponentError> {
+        let trait_type_id = TypeId::of::<Trait>();
+        let cache_key = (trait_type_id, name.to_string());
+
+        let arc_injectable = TRAIT_OBJ_CACHE
+            .get(&cache_key)
+            .ok_or_else(|| ComponentError::TraitImplNotFound {
+                trait_name: std::any::type_name::<Trait>().to_string(),
+            })?
+            .value()
+            .clone();
+
+        // 将 Arc<dyn Injectable> 转为裸指针，再通过 transmute_copy 转为目标 trait 的裸指针
+        let ptr_injectable: *const dyn Injectable = Arc::into_raw(arc_injectable);
+        // SAFETY: *const dyn Injectable 和 *const Trait 都是 fat pointer（128 bits on 64-bit），
+        // 二进制布局相同（data_ptr + vtable_ptr）。
+        // Trait: Injectable 保证 vtable 兼容 —— dyn Trait 的 vtable 包含了 dyn Injectable 的方法。
+        let ptr_trait: *const Trait =
+            unsafe { std::mem::transmute_copy::<*const dyn Injectable, *const Trait>(&ptr_injectable) };
+        // SAFETY: ptr_trait 由 Arc::into_raw 创建的指针经 transmute 得到，类型匹配
+        Ok(unsafe { Arc::from_raw(ptr_trait) })
+    }
+
+    /// 按 trait 获取唯一实现 → `Arc<dyn Trait>`
+    ///
+    /// 从 `INSTANCE_NAMES_BY_TRAIT`（`populate_trait_obj_cache` 时填充）
+    /// 直接获取该 trait 的所有实例名，要求恰好一个。
+    ///
+    /// **不扫描 `COMPONENT_REPOSITORY`**，避免 create 阶段的死锁：
+    /// create 持有 `get_mut` 写锁，遍历 `COMPONENT_REPOSITORY.iter()` 会阻塞在同一 shard。
+    ///
+    /// 错误：
+    /// - 0 个实现类型 → `TraitImplNotFound`
+    /// - 多个实现类型或实例 → `AmbiguousTraitImpl`
+    pub fn get_component_by_trait<Trait: Injectable + ?Sized>(
+    ) -> Result<Arc<Trait>, ComponentError> {
+        let trait_type_id = TypeId::of::<Trait>();
+        let trait_name = std::any::type_name::<Trait>().to_string();
+
+        let instance_names = INSTANCE_NAMES_BY_TRAIT
+            .get(&trait_type_id)
+            .ok_or_else(|| ComponentError::TraitImplNotFound {
+                trait_name: trait_name.clone(),
+            })?;
+
+        let names = instance_names.value();
+        if names.is_empty() {
+            return Err(ComponentError::TraitImplNotFound { trait_name });
+        }
+        if names.len() > 1 {
+            return Err(ComponentError::AmbiguousTraitImpl {
+                trait_name,
+                candidates: names.clone(),
+            });
+        }
+
+        Self::get_component_by_trait_and_name::<Trait>(&names[0])
+    }
+
+    /// 按 trait 获取所有实现 → `Vec<Arc<dyn Trait>>`
+    ///
+    /// 从 `INSTANCE_NAMES_BY_TRAIT` 直接获取该 trait 的所有实例名，
+    /// 逐个从 `TRAIT_OBJ_CACHE` 取出。
+    ///
+    /// **不扫描 `COMPONENT_REPOSITORY`**，避免 create 阶段的死锁。
+    ///
+    /// 如果 trait 没有实现类型或所有实例都未被缓存，返回空 Vec。
+    pub fn get_components_by_trait<Trait: Injectable + ?Sized>(
+    ) -> Result<Vec<Arc<Trait>>, ComponentError> {
+        let trait_type_id = TypeId::of::<Trait>();
+        let trait_name = std::any::type_name::<Trait>().to_string();
+
+        let instance_names = INSTANCE_NAMES_BY_TRAIT
+            .get(&trait_type_id)
+            .ok_or_else(|| ComponentError::TraitImplNotFound {
+                trait_name: trait_name.clone(),
+            })?;
+
+        let mut results = Vec::new();
+        for name in instance_names.value().iter() {
+            match Self::get_component_by_trait_and_name::<Trait>(name) {
+                Ok(entry) => results.push(entry),
+                Err(_) => {
+                    tracing::debug!(
+                        "Trait '{}' instance '{}' not found in cache, skipped",
+                        trait_name, name
+                    );
                 }
             }
         }

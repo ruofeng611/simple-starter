@@ -1,5 +1,7 @@
 use crate::utils::macro_build_util::{
-    get_arc_inner_type, get_short_type_name_from_type, parse_and_strip_inject,
+    get_arc_inner_type, get_dyn_trait_in_arc, get_dyn_trait_in_vec_arc,
+    get_short_type_name_from_type, is_arc_dyn_trait, is_vec_arc_dyn_trait,
+    parse_and_strip_inject, trait_object_to_type,
 };
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -52,6 +54,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
 
     // 3. 解析函数参数（处理依赖注入）
     let mut dependencies_names = Vec::new();
+    let mut trait_dependency_fns: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut arg_preparations = Vec::new(); // 生成从容器获取参数的代码
     let mut call_args = Vec::new(); // 生成函数调用时的参数列表
 
@@ -69,35 +72,64 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                 // 3.1 处理参数上的 #[inject]
                 let (_is_injected, inject_name) = parse_and_strip_inject(&mut pat_type.attrs);
 
-                // 3.2 验证参数类型必须为 Arc<T>
-                let inner_type = get_arc_inner_type(&pat_type.ty).ok_or_else(|| {
-                    syn::Error::new(
-                        pat_type.ty.span(),
-                        "Component provider arguments must be of type Arc<T>",
-                    )
-                });
-
-                let inner_type = match inner_type {
-                    Ok(t) => t,
-                    Err(e) => return e.to_compile_error().into(),
-                };
-
-                // 3.3 生成获取依赖的代码
                 let arg_var_name = Ident::new(&format!("arg_{}", i), Span::call_site());
 
-                if let Some(name) = inject_name {
-                    // 按名称获取
-                    dependencies_names.push(name.clone());
+                // 3.2 根据参数类型选择注入策略
+                if is_vec_arc_dyn_trait(&pat_type.ty) {
+                    // Vec<Arc<dyn Trait>>
+                    let trait_obj = get_dyn_trait_in_vec_arc(&pat_type.ty).unwrap();
+                    let trait_type = trait_object_to_type(trait_obj);
+                    trait_dependency_fns.push(quote! { || ::std::any::TypeId::of::<#trait_type>() });
                     arg_preparations.push(quote! {
-                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?;
+                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_components_by_trait::<#trait_type>()?;
                     });
+
+                } else if is_arc_dyn_trait(&pat_type.ty) {
+                    // Arc<dyn Trait>
+                    let trait_obj = get_dyn_trait_in_arc(&pat_type.ty).unwrap();
+                    let trait_type = trait_object_to_type(trait_obj);
+
+                    if let Some(name) = inject_name {
+                        // 按名称注入：依赖明确，直接加名称即可，
+                        // 不需要 trait TypeId 依赖（避免对其他无关实现建立虚假依赖边）
+                        dependencies_names.push(name.clone());
+                        arg_preparations.push(quote! {
+                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_trait_and_name::<#trait_type>(#name)?;
+                        });
+                    } else {
+                        // 按 trait 注入：依赖所有实现，通过 TypeId 解析
+                        trait_dependency_fns.push(quote! { || ::std::any::TypeId::of::<#trait_type>() });
+                        arg_preparations.push(quote! {
+                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_trait::<#trait_type>()?;
+                        });
+                    }
+
                 } else {
-                    // 按类型获取
-                    let short_name = get_short_type_name_from_type(inner_type);
-                    dependencies_names.push(short_name);
-                    arg_preparations.push(quote! {
-                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?;
+                    // 普通 Arc<T>
+                    let inner_type = get_arc_inner_type(&pat_type.ty).ok_or_else(|| {
+                        syn::Error::new(
+                            pat_type.ty.span(),
+                            "Component provider arguments must be of type Arc<T>, Arc<dyn Trait>, or Vec<Arc<dyn Trait>>",
+                        )
                     });
+
+                    let inner_type = match inner_type {
+                        Ok(t) => t,
+                        Err(e) => return e.to_compile_error().into(),
+                    };
+
+                    if let Some(name) = inject_name {
+                        dependencies_names.push(name.clone());
+                        arg_preparations.push(quote! {
+                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?;
+                        });
+                    } else {
+                        let short_name = get_short_type_name_from_type(inner_type);
+                        dependencies_names.push(short_name);
+                        arg_preparations.push(quote! {
+                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?;
+                        });
+                    }
                 }
 
                 call_args.push(arg_var_name);
@@ -141,6 +173,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
         ::simple_starter_core::submit! {
             ::simple_starter_core::ComponentProcessorFactory {
                 dependencies: &[#(#dependencies_names),*],
+                trait_dependencies: &[#(#trait_dependency_fns),*],
                 name: #final_component_name,
                 type_id: std::any::TypeId::of::<#component_type>(),
                 constructor: || {
