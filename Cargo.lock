@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "simple-starter-core"
-version = "2.1.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -880,6 +880,7 @@ dependencies = [
  "inventory",
  "serde",
  "serde_json",
+ "simple-starter-macro",
  "thiserror",
  "time",
  "tokio",
@@ -893,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "simple-starter-macro"
-version = "2.1.0"
+version = "2.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -902,12 +903,13 @@ dependencies = [
 
 [[package]]
 name = "simple-starter-security"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "async-trait",
  "inventory",
  "serde_json",
  "simple-starter-core",
+ "simple-starter-macro",
  "simple-starter-web",
  "thiserror",
  "toml",
@@ -915,7 +917,7 @@ dependencies = [
 
 [[package]]
 name = "simple-starter-web"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -923,6 +925,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simple-starter-core",
+ "simple-starter-macro",
  "tokio",
  "tokio-util",
  "toml",

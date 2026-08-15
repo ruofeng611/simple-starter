@@ -163,7 +163,7 @@ pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> To
                 let route_registration = quote! {
                     #handler_fn
 
-                    ::simple_starter_web::submit!(
+                    ::simple_starter_core::submit!(
                         ::simple_starter_web::RouteFactory {
                             router: || {
                                 ::simple_starter_web::axum::Router::new()

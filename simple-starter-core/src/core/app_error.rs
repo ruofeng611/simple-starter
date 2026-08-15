@@ -50,9 +50,6 @@ pub enum ComponentError {
     #[error("Failed to downcast component: {type_name}, name: {name}")]
     DowncastFailed { type_name: String, name: String },
 
-    #[error("Component already exists for type: {type_name}, name: {name}")]
-    AlreadyExists { type_name: String, name: String },
-
     #[error("Component not initialized (inner is None) for type: {type_name}, name: {name}")]
     NotInitialized { type_name: String, name: String },
 
@@ -65,6 +62,12 @@ pub enum ComponentError {
     #[error("Ambiguous trait implementation for '{trait_name}': candidates = {candidates:?}")]
     AmbiguousTraitImpl {
         trait_name: String,
+        candidates: Vec<String>,
+    },
+
+    #[error("Multiple component instances found for type '{type_name}': candidates = {candidates:?}")]
+    AmbiguousComponent {
+        type_name: String,
         candidates: Vec<String>,
     },
 }

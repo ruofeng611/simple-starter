@@ -14,8 +14,8 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
     let ast = parse_macro_input!(input as DeriveInput);
     let struct_name = &ast.ident;
 
-    // 1. 解析宏参数 (prefix, name)
-    let (prefix, custom_name) = match parse_configuration_args(args) {
+    // 1. 解析宏参数 (prefix, name, condition)
+    let (prefix, custom_name, condition) = match parse_configuration_args(args) {
         Ok(args) => args,
         Err(err) => return err.to_compile_error().into(),
     };
@@ -36,7 +36,13 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
         })
     };
 
-    // 4. 生成 Inventory 注册代码
+    // 4. 生成条件声明（条件表达式包进惰性闭包，注册期求值一次）
+    let condition_impl = match condition {
+        Some(expr) => quote! { Some(|| #expr) },
+        None => quote! { None },
+    };
+
+    // 5. 生成 Inventory 注册代码
     // 配置组件没有其他组件依赖，也没有 init/destroy 方法
     let inventory_impl = quote! {
         ::simple_starter_core::submit! {
@@ -44,8 +50,10 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
                 // 配置对象不需要依赖注入其他组件，所以依赖列表为空
                 dependencies: &[],
                 trait_dependencies: &[],
+                type_dependencies: &[],
+                primary_dependencies: &[],
                 name: #final_component_name,
-                type_id: std::any::TypeId::of::<#struct_name>(),
+                condition: #condition_impl,
                 constructor: || {
                     let wrapper = ::simple_starter_core::ComponentWrapper::<#struct_name>::new(
                         #create_fn_impl,
@@ -58,7 +66,7 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
         }
     };
 
-    // 5. 输出最终代码
+    // 6. 输出最终代码
     let output = quote! {
         #ast
         #inventory_impl
@@ -68,10 +76,13 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
 }
 
 /// 解析配置宏参数
-/// 返回 (Prefix, Option<Name>)
-fn parse_configuration_args(args: TokenStream) -> syn::Result<(String, Option<String>)> {
+/// 返回 (Prefix, Option<Name>, Option<Condition>)
+fn parse_configuration_args(
+    args: TokenStream,
+) -> syn::Result<(String, Option<String>, Option<syn::Expr>)> {
     let mut prefix = None;
     let mut name = None;
+    let mut condition = None;
 
     if args.is_empty() {
         return Err(syn::Error::new(
@@ -82,10 +93,10 @@ fn parse_configuration_args(args: TokenStream) -> syn::Result<(String, Option<St
 
     // 1. 尝试解析为单字符串参数：#[configuration("my.config")]
     if let Ok(lit) = syn::parse2::<LitStr>(args.clone().into()) {
-        return Ok((lit.value(), None));
+        return Ok((lit.value(), None, None));
     }
 
-    // 2. 尝试解析为键值对：#[configuration(prefix = "...", name = "...")]
+    // 2. 尝试解析为键值对：#[configuration(prefix = "...", name = "...", condition = <expr>)]
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("prefix") {
             let value: LitStr = meta.value()?.parse()?;
@@ -95,15 +106,20 @@ fn parse_configuration_args(args: TokenStream) -> syn::Result<(String, Option<St
             let value: LitStr = meta.value()?.parse()?;
             name = Some(value.value());
             Ok(())
+        } else if meta.path.is_ident("condition") {
+            // 直接解析为表达式（如 ComponentCondition::on_missing_trait::<dyn X>()），嵌入惰性闭包
+            let expr: syn::Expr = meta.value()?.parse()?;
+            condition = Some(expr);
+            Ok(())
         } else {
-            Err(meta.error("unsupported configuration property. supported: 'prefix', 'name'"))
+            Err(meta.error("unsupported configuration property. supported: 'prefix', 'name', 'condition'"))
         }
     });
 
     Parser::parse2(parser, args.clone().into())?;
 
     match prefix {
-        Some(p) => Ok((p, name)),
+        Some(p) => Ok((p, name, condition)),
         None => Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "Missing required argument 'prefix' in #[configuration]",

@@ -113,7 +113,7 @@ pub(crate) fn route_macro(method: &str, args: TokenStream, input: TokenStream) -
     // - 使用 submit! 宏注册 RouteFactory
     let expanded = quote! {
         #input_fn
-        ::simple_starter_web::submit!(
+        ::simple_starter_core::submit!(
             ::simple_starter_web::RouteFactory {
                 router: || { #router_build },
             }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::whitelist::Whitelist;
 use simple_starter_core::tracing;
+use simple_starter_core::Injectable;
 use simple_starter_web::axum::{
     body::Body,
     extract::{MatchedPath, State},
@@ -53,8 +54,25 @@ impl UserContext {
 /// 用户信息提供者。
 ///
 /// 负责从 HTTP 请求中解析出当前用户上下文（如从 JWT Token、Session Cookie 等）。
+///
+/// # 使用方式
+/// 本接口无默认实现，必须注册自定义组件，否则所有请求将被拒绝：
+///
+/// ```ignore
+/// #[simple_starter_core::component]
+/// pub struct MyUserInfoProvider;
+///
+/// #[simple_starter_core::injectable]
+/// #[async_trait::async_trait]
+/// impl UserInfoProvider for MyUserInfoProvider {
+///     async fn get_user_context(&self, parts: &http::request::Parts) -> Option<UserContext> {
+///         // 从 Header / Cookie 中解析用户上下文
+///         todo!()
+///     }
+/// }
+/// ```
 #[async_trait::async_trait]
-pub trait UserInfoProvider: Send + Sync {
+pub trait UserInfoProvider: Injectable {
     /// 从请求元信息中解析用户上下文。
     ///
     /// 使用 `&http::request::Parts` 而非 `&Request<Body>`，
@@ -66,9 +84,9 @@ pub trait UserInfoProvider: Send + Sync {
 ///
 /// 由使用者实现，根据用户上下文和当前资源标识决定是否放行。
 ///
-/// 默认实现 [`DefaultPermissionChecker`] 直接检查用户上下文的 `resource_ids` 集合。
+/// 默认实现 `DefaultPermissionChecker` 直接检查用户上下文的 `resource_ids` 集合。
 #[async_trait::async_trait]
-pub trait PermissionChecker: Send + Sync {
+pub trait PermissionChecker: Injectable {
     /// 检查用户是否有权访问指定资源。
     async fn check(&self, user_ctx: &UserContext, resource_id: &str) -> bool;
 }
@@ -76,8 +94,13 @@ pub trait PermissionChecker: Send + Sync {
 /// 默认权限检查器。
 ///
 /// 直接调用 [`UserContext::has_resource`] 进行判断。
+///
+/// 以条件注册方式参与组件装配：当用户未提供任何 [`PermissionChecker`] 实现时注册本默认实现，
+/// 否则自动退位让位给用户实现。
+#[simple_starter_macro::component(condition = simple_starter_core::ComponentCondition::on_missing_trait::<dyn PermissionChecker>())]
 pub struct DefaultPermissionChecker;
 
+#[simple_starter_macro::injectable]
 #[async_trait::async_trait]
 impl PermissionChecker for DefaultPermissionChecker {
     async fn check(&self, user_ctx: &UserContext, resource_id: &str) -> bool {
@@ -115,7 +138,7 @@ pub enum SecurityError {
 /// 允许使用者自定义认证/授权失败时的 HTTP 响应，
 /// 例如返回带有业务状态码的 JSON 结构体，而非固定的 401/403 状态码。
 #[async_trait::async_trait]
-pub trait SecurityErrorHandler: Send + Sync {
+pub trait SecurityErrorHandler: Injectable {
     /// 未认证（无有效用户上下文）时的响应。
     async fn unauthorized(&self, parts: &http::request::Parts) -> Response;
 
@@ -128,8 +151,13 @@ pub trait SecurityErrorHandler: Send + Sync {
 /// 默认错误处理器。
 ///
 /// 直接返回标准的 HTTP 401/403 状态码。
+///
+/// 以条件注册方式参与组件装配：当用户未提供任何 [`SecurityErrorHandler`] 实现时注册本默认实现，
+/// 否则自动退位让位给用户实现。
+#[simple_starter_macro::component(condition = simple_starter_core::ComponentCondition::on_missing_trait::<dyn SecurityErrorHandler>())]
 pub struct DefaultSecurityErrorHandler;
 
+#[simple_starter_macro::injectable]
 #[async_trait::async_trait]
 impl SecurityErrorHandler for DefaultSecurityErrorHandler {
     async fn unauthorized(&self, _parts: &http::request::Parts) -> Response {

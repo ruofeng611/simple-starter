@@ -100,7 +100,7 @@ pub(crate) fn security_controller_macro(args: TokenStream, input: TokenStream) -
             let resource_name = resource_args.resource_name.unwrap_or(default_resource);
 
             registrations.push(quote! {
-                ::simple_starter_security::submit! {
+                ::simple_starter_core::submit! {
                     ::simple_starter_security::ResourceEntry {
                         path_pattern: #full_path,
                         resource_id: #resource_id,

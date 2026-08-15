@@ -1,9 +1,10 @@
 [package]
 name = "simple-starter-core"
-version = "2.1.0"
+version = "3.0.0"
 edition = "2024"
 
 [dependencies]
+simple-starter-macro = { path = "../simple-starter-macro" }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -1,7 +1,8 @@
 use crate::utils::macro_build_util::{
     get_arc_inner_type, get_dyn_trait_in_arc, get_dyn_trait_in_vec_arc,
-    get_short_type_name_from_type, is_arc_dyn_trait, is_vec_arc_dyn_trait,
-    parse_and_strip_inject, trait_object_to_type,
+    get_result_inner_type, get_short_type_name_from_type, is_arc_dyn_trait,
+    is_vec_arc_dyn_trait, parse_and_strip_inject, parse_and_strip_inject_primary,
+    trait_object_to_type,
 };
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -22,7 +23,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
     let mut func = parse_macro_input!(input as ItemFn);
 
     // 1. 解析宏参数
-    let (component_name, destroy_method) = match parse_provider_args(args) {
+    let (component_name, destroy_method, condition) = match parse_provider_args(args) {
         Ok(val) => val,
         Err(err) => return err.to_compile_error().into(),
     };
@@ -54,7 +55,9 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
 
     // 3. 解析函数参数（处理依赖注入）
     let mut dependencies_names = Vec::new();
-    let mut trait_dependency_fns: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut trait_dependency_type_ids: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut type_dependency_type_ids: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut primary_dependency_type_ids: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut arg_preparations = Vec::new(); // 生成从容器获取参数的代码
     let mut call_args = Vec::new(); // 生成函数调用时的参数列表
 
@@ -69,17 +72,55 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                     .into();
             }
             FnArg::Typed(pat_type) => {
-                // 3.1 处理参数上的 #[inject]
-                let (_is_injected, inject_name) = parse_and_strip_inject(&mut pat_type.attrs);
+                // 处理参数上的 #[inject] / #[inject_primary]
+                let (is_injected, inject_name) = parse_and_strip_inject(&mut pat_type.attrs);
+                let is_primary = parse_and_strip_inject_primary(&mut pat_type.attrs);
 
                 let arg_var_name = Ident::new(&format!("arg_{}", i), Span::call_site());
 
-                // 3.2 根据参数类型选择注入策略
-                if is_vec_arc_dyn_trait(&pat_type.ty) {
+                // #[inject_primary] 单独使用即隐含注入语义；与 #[inject] 互斥
+                if is_primary && is_injected {
+                    return syn::Error::new(
+                        pat_type.span(),
+                        "#[inject_primary] cannot be combined with #[inject] on provider argument",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+
+                // 根据参数类型选择注入策略
+                if is_primary {
+                    // primary 注入：仅允许具体类型 Arc<T>（primary 按具体类型维度注册）
+                    if is_vec_arc_dyn_trait(&pat_type.ty) || is_arc_dyn_trait(&pat_type.ty) {
+                        return syn::Error::new(
+                            pat_type.ty.span(),
+                            "#[inject_primary] on provider argument requires a concrete type `Arc<T>`; trait types are not supported (primary is registered on the concrete type dimension)",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
+
+                    let inner_type = match get_arc_inner_type(&pat_type.ty) {
+                        Some(ty) => ty,
+                        None => {
+                            return syn::Error::new(
+                                pat_type.ty.span(),
+                                "Provider argument marked with #[inject_primary] must be of type Arc<T>",
+                            )
+                            .to_compile_error()
+                            .into();
+                        }
+                    };
+
+                    primary_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#inner_type>() });
+                    arg_preparations.push(quote! {
+                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_primary_component::<#inner_type>()?;
+                    });
+                } else if is_vec_arc_dyn_trait(&pat_type.ty) {
                     // Vec<Arc<dyn Trait>>
                     let trait_obj = get_dyn_trait_in_vec_arc(&pat_type.ty).unwrap();
                     let trait_type = trait_object_to_type(trait_obj);
-                    trait_dependency_fns.push(quote! { || ::std::any::TypeId::of::<#trait_type>() });
+                    trait_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#trait_type>() });
                     arg_preparations.push(quote! {
                         let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_components_by_trait::<#trait_type>()?;
                     });
@@ -98,7 +139,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                         });
                     } else {
                         // 按 trait 注入：依赖所有实现，通过 TypeId 解析
-                        trait_dependency_fns.push(quote! { || ::std::any::TypeId::of::<#trait_type>() });
+                        trait_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#trait_type>() });
                         arg_preparations.push(quote! {
                             let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_trait::<#trait_type>()?;
                         });
@@ -124,8 +165,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                             let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?;
                         });
                     } else {
-                        let short_name = get_short_type_name_from_type(inner_type);
-                        dependencies_names.push(short_name);
+                        type_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#inner_type>() });
                         arg_preparations.push(quote! {
                             let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?;
                         });
@@ -168,14 +208,22 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
         quote! { None }
     };
 
-    // 5. 生成 Inventory 注册代码
+    // 5. 生成条件声明（条件表达式包进惰性闭包，注册期求值一次）
+    let condition_impl = match condition {
+        Some(expr) => quote! { Some(|| #expr) },
+        None => quote! { None },
+    };
+
+    // 6. 生成 Inventory 注册代码
     let inventory_impl = quote! {
         ::simple_starter_core::submit! {
             ::simple_starter_core::ComponentProcessorFactory {
                 dependencies: &[#(#dependencies_names),*],
-                trait_dependencies: &[#(#trait_dependency_fns),*],
+                trait_dependencies: &[#(#trait_dependency_type_ids),*],
+                type_dependencies: &[#(#type_dependency_type_ids),*],
+                primary_dependencies: &[#(#primary_dependency_type_ids),*],
                 name: #final_component_name,
-                type_id: std::any::TypeId::of::<#component_type>(),
+                condition: #condition_impl,
                 constructor: || {
                     let wrapper = ::simple_starter_core::ComponentWrapper::<#component_type>::new(
                         #create_fn_impl,
@@ -188,7 +236,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
         }
     };
 
-    // 6. 输出结果
+    // 7. 输出结果
     let output = quote! {
         #func
         #inventory_impl
@@ -198,12 +246,15 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
 }
 
 /// 解析 provider 宏参数
-fn parse_provider_args(args: TokenStream) -> syn::Result<(Option<String>, Option<syn::Expr>)> {
+fn parse_provider_args(
+    args: TokenStream,
+) -> syn::Result<(Option<String>, Option<syn::Expr>, Option<syn::Expr>)> {
     let mut name = None;
     let mut destroy_method: Option<syn::Expr> = None;
+    let mut condition: Option<syn::Expr> = None;
 
     if args.is_empty() {
-        return Ok((None, None));
+        return Ok((None, None, None));
     }
 
     let parser = syn::meta::parser(|meta| {
@@ -216,6 +267,11 @@ fn parse_provider_args(args: TokenStream) -> syn::Result<(Option<String>, Option
             let expr: syn::Expr = meta.value()?.parse()?;
             destroy_method = Some(expr);
             Ok(())
+        } else if meta.path.is_ident("condition") {
+            // 直接解析为表达式（如 ComponentCondition::on_missing_trait::<dyn X>()），嵌入惰性闭包
+            let expr: syn::Expr = meta.value()?.parse()?;
+            condition = Some(expr);
+            Ok(())
         } else {
             Err(meta.error("unsupported property"))
         }
@@ -223,33 +279,11 @@ fn parse_provider_args(args: TokenStream) -> syn::Result<(Option<String>, Option
 
     // 支持位置参数简写: #[provider("name")]
     if let Ok(lit) = syn::parse2::<LitStr>(args.clone().into()) {
-        return Ok((Some(lit.value()), None));
+        return Ok((Some(lit.value()), None, None));
     }
 
     // Key-Value 解析
     Parser::parse2(parser, args.clone().into())?;
 
-    Ok((name, destroy_method))
-}
-
-/// 辅助函数：尝试从 Result<T, E> 或 anyhow::Result<T> 中提取 T
-///
-/// 逻辑：
-/// 1. 检查是否为 Path 类型。
-/// 2. 检查最后一个段是否为 "Result"。
-/// 3. 获取尖括号内的第一个泛型参数作为类型。
-fn get_result_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
-    if let syn::Type::Path(type_path) = ty {
-        if let Some(segment) = type_path.path.segments.last() {
-            if segment.ident == "Result" {
-                if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                    // Result<T> 或 Result<T, E>，我们只需要第一个参数 T
-                    if let Some(syn::GenericArgument::Type(inner_ty)) = args.args.first() {
-                        return Some(inner_ty);
-                    }
-                }
-            }
-        }
-    }
-    None
+    Ok((name, destroy_method, condition))
 }

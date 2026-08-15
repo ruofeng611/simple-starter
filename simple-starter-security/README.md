@@ -1,268 +1,263 @@
 # simple-starter-security
 
-Security 模块为 simple-starter 提供编译期资源收集、运行时白名单放行、用户认证与权限校验等安全能力。
+`simple-starter-security` 是 simple-starter 的**安全插件模块**：提供编译期资源收集、运行时白名单放行、用户认证与权限校验能力，以 Axum 中间件形式集成到 Web 服务，并重导出全部安全宏。
 
-## 核心特性
+## 一、基本原理
 
-- **双层拦截**：白名单路径放行 + 基于资源标识的权限校验
-- **编译期收集**：通过 `inventory` 在编译期静态收集安全资源，运行时零反射开销
-- **灵活扩展**：所有核心行为均为 trait，支持自定义用户信息解析、权限检查、错误响应等
-- **Axum 原生集成**：以 Axum 中间件形式注入，支持 `MatchedPath` 路由模式匹配
-- **基础路径自动拼接**：自动适配 `web.base_path` 配置，无需手动修改资源路径
+### 1. 编译期资源收集
 
-## 快速开始
+安全资源（接口的权限元数据）在**编译期**通过 `inventory` 静态收集：
 
-### 1. 添加 SecurityPlugin
+1. `#[security]` / `#[security_controller]` + `#[security_resource]` 宏展开为 `ResourceEntry`（`path_pattern` + `resource_id` + `resource_name` + 模块信息）并 `submit!` 注册。
+2. `SecurityPlugin::components_ready` 阶段遍历 inventory 收集全部条目，构建 `path_pattern -> resource_id` 映射表（运行时校验路径唯一性）。
+3. 运行期权限校验时，Axum `MatchedPath` 提供实际匹配的路由模式，直接查表得到 `resource_id`，零反射开销。
+
+### 2. 中间件执行流程
+
+安全中间件在业务 handler 之前拦截请求，按序执行：
+
+1. 白名单检查：命中白名单直接放行
+2. 解析用户上下文：`UserInfoProvider` 从请求头/令牌解析，失败返回 401
+3. 用户状态检查：禁用或过期返回 403
+4. 权限检查：`MatchedPath` → `resource_id` → `PermissionChecker::check`，不通过返回 403
+5. 放行：把 `UserContext` 附加到 Request extensions（handler 经 `extract::Extension<UserContext>` 获取）
+
+### 3. 基础路径拼接
+
+`BasePathProvider`（默认读 `web.base_path`）提供基础路径，`components_ready` 阶段将其与资源路径拼接（如 `/api` + `/test/student/add`），保证 `MatchedPath` 与资源映射表 key 精确匹配。
+
+### 4. 协作接口与覆盖语义
+
+四个协作接口均通过**组件仓库**获取（trait 对象注入）：
+
+| 接口 | 默认实现 | 未提供时的行为 |
+|---|---|---|
+| `UserInfoProvider` | 无 | **拒绝所有请求**（必须由用户提供） |
+| `PermissionChecker` | 有（校验 `resource_ids` 集合） | 自动使用默认实现 |
+| `SecurityErrorHandler` | 有（返回标准 401/403） | 自动使用默认实现 |
+| `BasePathProvider` | 有（读 `web.base_path`） | 自动使用默认实现 |
+
+默认实现以 `on_missing_trait` 条件注册：用户注册自定义实现时自动退位，未注册时生效。
+
+## 二、导出的用户可用组件与宏
+
+### 1. SecurityPlugin（插件入口）
 
 ```rust
 use simple_starter_core::Application;
-use simple_starter_security::{SecurityPlugin, UserContext, UserInfoProvider};
+use simple_starter_security::SecurityPlugin;
 use simple_starter_web::WebPlugin;
 
 fn main() {
     Application::new()
-        .register_plugin(
-            SecurityPlugin::new()
-                .with_user_info_provider(MyUserInfoProvider)
-        )
-        .register_plugin(WebPlugin::new())
+        .register_plugin(WebPlugin::new())     // SecurityPlugin 依赖 WebPlugin（自动拓扑排序）
+        .register_plugin(SecurityPlugin::new()
+            .add_whitelist(Some("GET"), "/health")   // 精确匹配
+            .add_whitelist(None, "/public/*"))       // 前缀匹配，None = 所有方法
         .run();
 }
 ```
 
-### 2. 在 Controller 上标记安全资源
+| 方法 | 说明 |
+|---|---|
+| `new()` | 创建插件 |
+| `add_whitelist(method, path)` | 添加白名单：`method` 为 `None` 匹配所有方法；`path` 以 `/*` 结尾为前缀匹配，否则精确匹配 |
+| `collect_resources()` | 静态方法，获取编译期收集的全部 `ResourceEntry`（任意时刻可调用） |
+
+### 2. 安全宏
+
+#### `#[security_controller]` + `#[security_resource]`（impl 块形式）
+
+`#[security_controller]` 必须放在 `#[rest_controller]` **外层**（属性宏执行顺序：外 → 内）；仅显式标记 `#[security_resource]` 的方法才注册资源：
 
 ```rust
-use simple_starter_macro::{rest_controller, post_mapping, security_controller, security_resource};
+use simple_starter_security::{security_controller, security_resource};
 
 #[security_controller]
 #[rest_controller("/test")]
 impl TestController {
     #[post_mapping("/student/add")]
     #[security_resource]
-    pub async fn add_student(&self) -> JsonResponse {
-        // 只有拥有该资源权限的用户才能访问
-        JsonResponse::ok(())
-    }
+    pub async fn add_student(&self) -> JsonResponse { /* 受保护资源 */ }
 }
 ```
 
-### 3. 在 Handler 中获取用户上下文
+资源标识默认为 `Controller名::方法名`（如 `TestController::add_student`），可用 `#[security_resource(resource_id = "...", resource_name = "...")]` 覆盖。
+
+#### `#[security]`（自由函数形式）
+
+作用于自由函数，必须搭配 `#[get]` / `#[post]` / `#[put]` / `#[delete]` 使用：
 
 ```rust
-use simple_starter_web::axum::extract;
-use simple_starter_security::UserContext;
-
-pub async fn handler(
-    extract::Extension(user_ctx): extract::Extension<UserContext>,
-) -> JsonResponse {
-    println!("user_id: {}", user_ctx.user_id);
-    println!("has resource: {}", user_ctx.has_resource("test::add_student"));
-    JsonResponse::ok(())
-}
+#[security(resource_id = "student_query", resource_name = "学生查询")]
+#[get("/student/{id}")]
+#[json_response]
+async fn get_student(axum::extract::Path(id): axum::extract::Path<i64>) -> JsonResponse { /* ... */ }
 ```
 
-## 核心概念
+### 3. UserContext（用户上下文）
 
-### SecurityPlugin
-
-`SecurityPlugin` 是安全模块的入口，作为 `Plugin` 注册到 `Application` 中。
-
-```rust
-SecurityPlugin::new()
-    .with_user_info_provider(MyUserInfoProvider)   // 设置用户信息提供者（可选，但强烈建议）
-    .with_permission_checker(MyPermissionChecker) // 自定义权限检查器（可选）
-    .with_error_handler(MyErrorHandler)           // 自定义错误响应（可选）
-    .with_base_path_provider(MyBasePathProvider)  // 自定义基础路径提供者（可选）
-    .add_whitelist(Some("GET"), "/public/*")      // 添加白名单
-```
-
-### 资源标识（ResourceEntry）
-
-资源标识通过属性宏在编译期注册，运行时由 `SecurityPlugin` 收集并构建 `path_pattern -> resource_id` 映射表。
-
-| 宏 | 作用位置 | 说明 |
-|---|---|---|
-| `#[security]` | 自由函数 | 必须配合 `#[get]`/`#[post]`/`#[put]`/`#[delete]` 使用 |
-| `#[security_controller]` | `impl` 块 | 必须放在 `#[rest_controller]` 外层（属性宏执行顺序：外→内） |
-| `#[security_resource]` | `impl` 方法 | 仅显式标记的方法才会注册资源信息 |
-
-### 用户上下文（UserContext）
+由 `UserInfoProvider` 构造，经中间件附加到请求，handler 通过 `extract::Extension<UserContext>` 获取：
 
 ```rust
 pub struct UserContext {
-    pub user_id: String,           // 用户唯一标识
-    pub resource_ids: Vec<String>, // 拥有的资源标识列表
-    pub is_disabled: bool,         // 是否被禁用
-    pub expired_at: Option<SystemTime>, // 过期时间
-    pub extra: Option<Value>,      // 扩展字段
+    pub user_id: String,                        // 用户唯一标识
+    pub resource_ids: HashSet<String>,          // 拥有的资源标识集合
+    pub is_disabled: bool,                      // 是否被禁用
+    pub expired_at: Option<std::time::SystemTime>, // 过期时间（None = 永不过期）
+    pub extra: Option<serde_json::Value>,       // 业务自定义扩展字段
 }
 
 impl UserContext {
     pub fn has_resource(&self, resource_id: &str) -> bool;
-    pub fn is_expired(&self) -> bool;   // None 表示永不过期
-    pub fn is_active(&self) -> bool;    // !is_disabled && !is_expired()
+    pub fn is_expired(&self) -> bool;
+    pub fn is_active(&self) -> bool;   // !is_disabled && !is_expired()
 }
 ```
 
-### 权限检查器（PermissionChecker）
+### 4. SecurityError（安全错误类型）
 
-默认实现 `DefaultPermissionChecker` 直接调用 `user_ctx.has_resource(resource_id)` 判断。
+中间件产生的所有错误均经 `SecurityErrorHandler` 精确处理：
 
-```rust
-#[async_trait::async_trait]
-pub trait PermissionChecker: Send + Sync {
-    async fn check(&self, user_ctx: &UserContext, resource_id: &str) -> bool;
-}
-```
+| 变体 | 场景 |
+|---|---|
+| `UserDisabled { user_id }` | 用户被禁用 |
+| `UserExpired { user_id }` | 会话已过期 |
+| `MatchedPathUnavailable` | 无法获取路由匹配模式 |
+| `ResourceNotFound { pattern }` | 路径未注册对应资源 |
+| `PermissionDenied { user_id, resource_id }` | 权限校验不通过 |
 
-你可以通过 `with_permission_checker` 提供自定义实现（如基于 RBAC、ABAC 的复杂逻辑）。
+## 三、扩展点（协作接口自定义实现）
 
-### 错误处理器（SecurityErrorHandler）
+### 1. UserInfoProvider（必填）
 
-默认返回标准 HTTP 401/403。你可以自定义返回 JSON 格式的业务错误响应：
-
-```rust
-#[async_trait::async_trait]
-pub trait SecurityErrorHandler: Send + Sync {
-    async fn unauthorized(&self, parts: &http::request::Parts) -> Response;
-    async fn forbidden(&self, parts: &http::request::Parts, error: &SecurityError) -> Response;
-}
-```
-
-> **注意**：参数使用 `&Parts` 而非 `&Request<Body>`，以规避 `Body` 非 `Sync` 导致 `async_trait` Future 非 `Send` 的陷阱。
-
-## 配置说明
-
-### security.log_warn
-
-控制安全中间件是否打印警告日志（如用户禁用、资源未找到、权限不足等）。
-
-```toml
-[security]
-log_warn = true  # 默认 true，生产环境可设为 false 减少噪音
-```
-
-### web.base_path
-
-`DefaultBasePathProvider` 自动从 `web.base_path` 读取基础路径，并在构建资源映射表时自动拼接：
-
-```toml
-[web]
-base_path = "/api"
-```
-
-若 Controller 注册路径为 `/test/student/add`，则中间件实际匹配 `/api/test/student/add`。
-
-## 高级扩展
-
-### 自定义 UserInfoProvider
+无默认实现，必须注册自定义组件（否则所有请求被拒绝）：
 
 ```rust
-use simple_starter_security::{UserContext, UserInfoProvider};
-use simple_starter_web::axum::http;
-
+#[component]
 pub struct JwtUserInfoProvider;
 
+#[injectable]
 #[async_trait::async_trait]
 impl UserInfoProvider for JwtUserInfoProvider {
     async fn get_user_context(&self, parts: &http::request::Parts) -> Option<UserContext> {
-        let token = parts.headers.get("Authorization")?;
-        // 解析 JWT，构造 UserContext
-        Some(UserContext { /* ... */ })
+        let user_id = parts.headers.get("user-id")?.to_str().ok()?.to_string();
+        Some(UserContext {
+            user_id,
+            resource_ids: HashSet::new(),
+            is_disabled: false,
+            expired_at: None,
+            extra: None,
+        })
     }
 }
 ```
 
-### 自定义 SecurityErrorHandler（JSON 响应）
+### 2. PermissionChecker（可选，自定义校验逻辑）
 
 ```rust
-use simple_starter_security::{SecurityError, SecurityErrorHandler};
-use simple_starter_web::axum::{http, response::IntoResponse, Json};
+#[component]
+pub struct MyPermissionChecker;
 
+#[injectable]
+#[async_trait::async_trait]
+impl PermissionChecker for MyPermissionChecker {
+    async fn check(&self, user_ctx: &UserContext, resource_id: &str) -> bool {
+        // 基于 RBAC / ABAC 的自定义逻辑
+        user_ctx.has_resource(resource_id)
+    }
+}
+```
+
+### 3. SecurityErrorHandler（可选，自定义错误响应）
+
+```rust
+#[component]
 pub struct JsonSecurityErrorHandler;
 
+#[injectable]
 #[async_trait::async_trait]
 impl SecurityErrorHandler for JsonSecurityErrorHandler {
     async fn unauthorized(&self, parts: &http::request::Parts) -> axum::response::Response {
         let resp = JsonResponse {
             code: 401,
-            message: "未认证".to_string(),
-            data: Some(json!({"path": parts.uri.path()})),
+            message: "未认证，请登录后访问".to_string(),
+            data: Some(serde_json::json!({ "path": parts.uri.path() })),
             ..Default::default()
         };
-        (http::StatusCode::UNAUTHORIZED, Json(resp)).into_response()
+        (http::StatusCode::UNAUTHORIZED, axum::Json(resp)).into_response()
     }
 
     async fn forbidden(&self, parts: &http::request::Parts, error: &SecurityError) -> axum::response::Response {
         let resp = JsonResponse {
             code: 403,
             message: format!("权限不足: {}", error),
-            data: Some(json!({"path": parts.uri.path(), "detail": format!("{:?}", error)})),
+            data: Some(serde_json::json!({ "detail": format!("{:?}", error) })),
             ..Default::default()
         };
-        (http::StatusCode::FORBIDDEN, Json(resp)).into_response()
+        (http::StatusCode::FORBIDDEN, axum::Json(resp)).into_response()
     }
 }
 ```
 
-### 自定义 BasePathProvider
+### 4. BasePathProvider（可选，自定义基础路径）
 
 ```rust
-use simple_starter_security::BasePathProvider;
-
+#[component]
 pub struct FixedBasePathProvider;
 
+#[injectable]
 impl BasePathProvider for FixedBasePathProvider {
-    fn base_path(&self) -> String {
-        "/v2".to_string()
+    fn base_path(&self) -> String { "/v2".to_string() }
+}
+```
+
+## 四、组合使用示例
+
+以下示例串联用户上下文解析、自定义 JSON 错误响应、受保护资源与启动钩子初始化权限缓存：
+
+```rust
+use simple_starter_core::{component, injectable, Application, anyhow};
+use simple_starter_security::{SecurityPlugin, UserContext, UserInfoProvider, SecurityErrorHandler, SecurityError};
+use simple_starter_web::WebPlugin;
+use std::collections::HashSet;
+
+// 1. 自定义用户上下文提供者（从请求头 user-id 解析）
+#[component]
+pub struct UserInfoProviderImpl;
+#[injectable]
+#[async_trait::async_trait]
+impl UserInfoProvider for UserInfoProviderImpl {
+    async fn get_user_context(&self, parts: &http::request::Parts) -> Option<UserContext> {
+        let user_id = parts.headers.get("user-id")?.to_str().ok()?.to_string();
+        Some(UserContext {
+            user_id,
+            resource_ids: HashSet::new(),
+            is_disabled: false,
+            expired_at: None,
+            extra: None,
+        })
     }
 }
-```
 
-## 设计要点
-
-### 编译期资源收集
-
-资源通过 `inventory::submit!` 在编译期注册，`SecurityPlugin::collect_resources()` 可在任何时刻获取：
-
-```rust
-let resources = SecurityPlugin::collect_resources();
-for entry in resources {
-    println!("{} -> {}", entry.path_pattern, entry.resource_id);
+fn main() {
+    Application::new()
+        .register_plugin(WebPlugin::new())
+        .register_plugin(SecurityPlugin::new()
+            .add_whitelist(Some("GET"), "/health"))
+        // 启动钩子：组件就绪后初始化权限数据（user_id "1" 拥有全部资源权限）
+        .add_startup_hook(async {
+            let resources = SecurityPlugin::collect_resources();
+            // 把全部 resource_id 授权给 user_id "1" ...
+            Ok(())
+        })
+        .run();
 }
 ```
 
-### 运行时路径拼接
+## 五、配置项（`[security]` 节点）
 
-`init` 阶段读取 `base_path_provider.base_path()`，将 `/api` 与 `/test/student/add` 拼接为 `/api/test/student/add`，确保 `MatchedPath` 与 `resource_map` key 精确匹配。
-
-### 白名单机制
-
-白名单在权限校验之前执行，支持方法级别和通配符路径：
-
-```rust
-SecurityPlugin::new()
-    .add_whitelist(Some("GET"), "/public/*")
-    .add_whitelist(None, "/health")  // None 表示所有 HTTP 方法
+```toml
+[security]
+log_warn = true   # 是否打印安全警告日志（用户禁用、资源未找到、权限不足等）
 ```
-
-### 错误类型
-
-```rust
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum SecurityError {
-    #[error("User '{user_id}' is disabled")]
-    UserDisabled { user_id: String },
-    #[error("User '{user_id}' has expired")]
-    UserExpired { user_id: String },
-    #[error("MatchedPath not available")]
-    MatchedPathUnavailable,
-    #[error("No resource registered for path pattern '{pattern}'")]
-    ResourceNotFound { pattern: String },
-    #[error("User '{user_id}' denied access to resource '{resource_id}'")]
-    PermissionDenied { user_id: String, resource_id: String },
-}
-```
-
-所有错误均通过 `SecurityErrorHandler` 处理，你可以根据具体错误类型返回不同的业务状态码或响应体。

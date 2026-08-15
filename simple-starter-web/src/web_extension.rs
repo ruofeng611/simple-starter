@@ -8,6 +8,10 @@
 
 use axum::Router;
 use simple_starter_core::anyhow;
+use simple_starter_core::Injectable;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::TcpListener;
 
 /// 路由修改器类型别名。
 ///
@@ -19,13 +23,52 @@ type RouterModifier = Box<dyn FnOnce(Router) -> Router + Send>;
 /// 通过闭包将 `tower::Layer` 应用到 Router，规避 Layer 泛型类型擦除问题。
 type MiddlewareApplier = Box<dyn FnOnce(Router) -> Router + Send>;
 
-/// 监听器工厂类型别名。
+/// TCP 监听器工厂。
 ///
-/// 接收绑定地址和端口，返回异步构建的 TCP/TLS 监听器。
-type ListenerFactory = Box<
-    dyn FnOnce(&str, u16) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<tokio::net::TcpListener>> + Send>>
-        + Send,
->;
+/// 负责将监听地址与端口构建为 `TcpListener`。默认实现 [`DefaultTcpListenerFactory`] 为直连绑定，
+/// 用户可通过注册组件提供 TLS/HTTPS、Unix Domain Socket 等自定义实现（自动覆盖默认实现）。
+///
+/// # 使用方式
+/// 实现本 trait 并注册为组件，即可自动覆盖默认实现（默认实现带条件注册，用户提供实现时自动退位）：
+///
+/// ```ignore
+/// #[simple_starter_core::component]
+/// pub struct TlsListenerFactory;
+///
+/// #[simple_starter_core::injectable]
+/// #[async_trait::async_trait]
+/// impl TcpListenerFactory for TlsListenerFactory {
+///     async fn bind(&self, host: &str, port: u16) -> simple_starter_core::anyhow::Result<TcpListener> {
+///         // 在此构建 TLS / UDS 监听器
+///         todo!()
+///     }
+/// }
+/// ```
+#[async_trait::async_trait]
+pub trait TcpListenerFactory: Injectable {
+    /// 按地址与端口构建监听器。
+    async fn bind(&self, host: &str, port: u16) -> anyhow::Result<TcpListener>;
+}
+
+/// 默认 TCP 监听器工厂。
+///
+/// 直接绑定 TCP 监听。以条件注册方式参与组件装配：当用户未提供任何
+/// [`TcpListenerFactory`] 实现时注册本默认实现，否则自动退位让位给用户实现。
+#[simple_starter_macro::component(condition = simple_starter_core::ComponentCondition::on_missing_trait::<dyn TcpListenerFactory>())]
+pub struct DefaultTcpListenerFactory;
+
+#[simple_starter_macro::injectable]
+#[async_trait::async_trait]
+impl TcpListenerFactory for DefaultTcpListenerFactory {
+    async fn bind(&self, host: &str, port: u16) -> anyhow::Result<TcpListener> {
+        let addr: SocketAddr = format!("{}:{}", host, port)
+            .parse()
+            .map_err(|e| anyhow::anyhow!("Invalid host:port configuration: {}:{} ({})", host, port, e))?;
+        TcpListener::bind(&addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind TCP listener: {}", e))
+    }
+}
 
 /// Web 扩展注册表。
 ///
@@ -33,7 +76,7 @@ type ListenerFactory = Box<
 pub struct WebExtensionRegistry {
     router_modifiers: Vec<RouterModifier>,
     middleware_appliers: Vec<MiddlewareApplier>,
-    listener_factory: Option<ListenerFactory>,
+    listener_factory: Option<Arc<dyn TcpListenerFactory>>,
     /// 服务协议前缀，用于日志输出（如 "http"、"https"）
     server_scheme: String,
 }
@@ -62,6 +105,14 @@ impl WebExtensionRegistry {
     /// 注册一个路由修改器。
     ///
     /// 修改器会在所有路由合并完成后、`base_path` 应用前调用。
+    ///
+    /// # 使用方式
+    /// 通常在自定义插件的 `assemble` 阶段通过应用上下文获取注册表后调用：
+    ///
+    /// ```ignore
+    /// ctx.get_extension_mut::<WebExtensionRegistry>()?
+    ///     .add_router_modifier(|router| router.fallback(fallback_handler));
+    /// ```
     pub fn add_router_modifier<F>(&mut self, modifier: F)
     where
         F: FnOnce(Router) -> Router + Send + 'static,
@@ -72,6 +123,14 @@ impl WebExtensionRegistry {
     /// 注册一个中间件应用器。
     ///
     /// 应用器会在 `base_path` 应用之后、框架自带的 `TraceLayer` 之前执行。
+    ///
+    /// # 使用方式
+    /// 通常在自定义插件的 `assemble` 阶段通过应用上下文获取注册表后调用：
+    ///
+    /// ```ignore
+    /// ctx.get_extension_mut::<WebExtensionRegistry>()?
+    ///     .add_middleware(|router| router.layer(CompressionLayer::new()));
+    /// ```
     pub fn add_middleware<F>(&mut self, applier: F)
     where
         F: FnOnce(Router) -> Router + Send + 'static,
@@ -79,17 +138,11 @@ impl WebExtensionRegistry {
         self.middleware_appliers.push(Box::new(applier));
     }
 
-    /// 设置自定义监听器工厂。
+    /// 注入监听器工厂组件。
     ///
-    /// 如果设置，将替代默认的 `tokio::net::TcpListener::bind`。
-    /// 典型用途：实现 TLS/HTTPS、Unix Domain Socket 等。
-    /// 注意：只能设置一次，后设置的会覆盖前者。
-    pub fn set_listener_factory<F, Fut>(&mut self, factory: F)
-    where
-        F: FnOnce(&str, u16) -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<tokio::net::TcpListener>> + Send + 'static,
-    {
-        self.listener_factory = Some(Box::new(move |host, port| Box::pin(factory(host, port))));
+    /// 由 `WebPlugin::finalize` 从组件仓库获取后注入（默认实现或用户覆盖）。
+    pub(crate) fn set_listener_factory(&mut self, factory: Arc<dyn TcpListenerFactory>) {
+        self.listener_factory = Some(factory);
     }
 
     pub(crate) fn take_router_modifiers(&mut self) -> Vec<RouterModifier> {
@@ -100,7 +153,7 @@ impl WebExtensionRegistry {
         std::mem::take(&mut self.middleware_appliers)
     }
 
-    pub(crate) fn take_listener_factory(&mut self) -> Option<ListenerFactory> {
+    pub(crate) fn take_listener_factory(&mut self) -> Option<Arc<dyn TcpListenerFactory>> {
         self.listener_factory.take()
     }
 }

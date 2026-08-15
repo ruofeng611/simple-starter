@@ -1,32 +1,16 @@
 use crate::ComponentWrapper;
 use crate::core::app_error::{ComponentError, LogExpectExt, TomlConfigError};
-use crate::core::app_types::{ComponentKey, DestroyFn};
-use crate::global_state::{COMPONENT_REPOSITORY, GLOBAL_CONFIG, INSTANCE_NAMES_BY_TRAIT, TRAIT_OBJ_CACHE};
-use crate::loaders::component_loader::COMPONENT_ORDER;
-use crate::utils::app_inner_util::get_short_type_name;
+use crate::global_state::{
+    COMPONENT_REPOSITORY, GLOBAL_CONFIG, PRIMARY_BY_TYPE, TRAIT_OBJ_CACHE,
+};
+use crate::utils::app_inner_util::{
+    get_component_names_by_type, get_impl_component_names_by_trait, get_short_type_name,
+};
 use serde::Deserialize;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 use toml::Value;
-use crate::core::app_component::Injectable;
-
-/// 动态注册组件时的顺序策略
-///
-/// 控制组件在启动顺序列表中的位置，从而影响创建/初始化顺序和销毁顺序。
-pub enum ComponentOrder {
-    /// 头插入：先创建、先初始化、后销毁。
-    /// 适用于基础设施组件（如 HttpTemplate），它们不依赖其他组件，但可能被其他组件依赖。
-    Front,
-    /// 尾插入：后创建、后初始化、先销毁。
-    /// 适用于普通组件或依赖已有组件的动态注册组件。
-    Back,
-}
-
-impl Default for ComponentOrder {
-    fn default() -> Self {
-        ComponentOrder::Back
-    }
-}
+use crate::core::app_component::{ComponentProcessor, Injectable};
 
 pub struct AppCoreUtil;
 
@@ -75,88 +59,57 @@ impl AppCoreUtil {
         })
     }
 
-    /// 动态注册组件，使用类型名作为名称
-    pub fn register_component<T, F, Fut>(
-        component: T,
-        destroy_fn: Option<F>,
-        order: ComponentOrder,
-    ) -> Result<(), ComponentError>
-    where
-        T: Any + Send + Sync + 'static,
-        F: FnOnce(T) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-    {
-        let name = get_short_type_name::<T>();
-        Self::register_component_with_name(component, name, destroy_fn, order)
-    }
-
-    /// 动态注册组件（指定名称）
-    ///
-    /// 在运行时将组件实例注入到仓库中。
-    pub fn register_component_with_name<T, S, F, Fut>(
-        component: T,
-        name: S,
-        destroy_fn: Option<F>,
-        order: ComponentOrder,
-    ) -> Result<(), ComponentError>
-    where
-        T: Any + Send + Sync + 'static,
-        S: Into<String>,
-        F: FnOnce(T) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-    {
-        let name_str = name.into();
-        let type_id = TypeId::of::<T>();
-        let key: ComponentKey = (type_id, name_str.clone());
-
-        // 1. 检查是否重复
-        if COMPONENT_REPOSITORY.contains_key(&key) {
-            return Err(ComponentError::AlreadyExists {
-                type_name: std::any::type_name::<T>().to_string(),
-                name: name_str,
-            });
-        }
-
-        // 2. 封装 Destroy 函数
-        let destroy_fn: Option<DestroyFn<T>> = if let Some(destroy_fn) = destroy_fn {
-            Some(Box::new(move |component| Box::pin(destroy_fn(component))))
-        } else {
-            None
-        };
-
-        // 3. 创建 Wrapper
-        let component_warper = ComponentWrapper {
-            create_fn: None,
-            init_fn: None,
-            destroy_fn,
-            inner: Some(Arc::new(component)),
-        };
-        COMPONENT_REPOSITORY.insert(key.clone(), Box::new(component_warper));
-
-        // 4. 记录顺序以便销毁
-        {
-            let mut order_guard =
-                COMPONENT_ORDER
-                    .lock()
-                    .map_err(|_| ComponentError::InternalError {
-                        message: "Failed to lock component order".to_string(),
-                    })?;
-            match order {
-                ComponentOrder::Front => order_guard.insert(0, key),
-                ComponentOrder::Back => order_guard.push(key),
-            }
-        }
-
-        Ok(())
-    }
-
     /// 获取组件实例（按类型）
+    ///
+    /// 先按类型短名（默认组件名）快速查找；未命中时（组件自定义名称）
+    /// 按具体类型收集全部实例名：
+    /// - 恰好一个 → 返回该实例
+    /// - 多个 → `AmbiguousComponent`
+    /// - 零个 → `NotFound`
     pub fn get_component<T>() -> Result<Arc<T>, ComponentError>
     where
         T: Any + Send + Sync + 'static,
     {
-        let name = get_short_type_name::<T>();
-        Self::get_component_by_name(name)
+        let short_name = get_short_type_name::<T>();
+
+        // 1. 快速路径：默认命名（类型短名）直接命中
+        if COMPONENT_REPOSITORY.contains_key(&short_name) {
+            return Self::get_component_by_name(short_name);
+        }
+
+        // 2. 兜底：组件自定义了名称，按具体类型收集全部实例名
+        let names = get_component_names_by_type(TypeId::of::<T>());
+        match names.as_slice() {
+            [] => Err(ComponentError::NotFound {
+                type_name: std::any::type_name::<T>().to_string(),
+                name: short_name,
+            }),
+            [name] => Self::get_component_by_name(name.clone()),
+            _ => Err(ComponentError::AmbiguousComponent {
+                type_name: std::any::type_name::<T>().to_string(),
+                candidates: names,
+            }),
+        }
+    }
+
+    /// 获取首要（primary）实例（按类型）
+    ///
+    /// 供插件方等"不知道用户会取什么名、必须按类型获取"的场景使用：
+    /// 1. 该类型注册了 primary → 直接返回 primary 实例
+    /// 2. 未注册 primary → 回退为 `get_component` 语义（默认名快速路径 + 按类型唯一实例）
+    pub fn get_primary_component<T>() -> Result<Arc<T>, ComponentError>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let type_id = TypeId::of::<T>();
+
+        // 1. primary 优先：该类型注册了首要实例，直接返回
+        if let Some(primary_name) = PRIMARY_BY_TYPE.get(&type_id) {
+            return Self::get_component_by_name(primary_name.value().clone());
+        }
+
+        // 2. 回退：与 get_component 一致的默认名快速路径 + 类型唯一性兜底
+        Self::get_component::<T>()
     }
 
     /// 获取组件实例（按名称）
@@ -166,10 +119,8 @@ impl AppCoreUtil {
         S: Into<String>,
     {
         let name_str = name.into();
-        let type_id = TypeId::of::<T>();
-        let key: ComponentKey = (type_id, name_str.clone());
 
-        if let Some(entry) = COMPONENT_REPOSITORY.get(&key) {
+        if let Some(entry) = COMPONENT_REPOSITORY.get(&name_str) {
             let processor = entry.value();
             let as_any = processor.as_any();
 
@@ -205,9 +156,10 @@ impl AppCoreUtil {
         let mut results = Vec::new();
 
         for entry in COMPONENT_REPOSITORY.iter() {
-            let ((type_id, name), processor) = entry.pair();
+            let (name, processor) = entry.pair();
 
-            if *type_id == target_type_id {
+            // 类型信息取自处理器本身（`ComponentProcessor::type_id`）；完全限定语法消除 Any::type_id 歧义
+            if ComponentProcessor::type_id(&**processor) == target_type_id {
                 if let Some(wrapper) = processor.as_any().downcast_ref::<ComponentWrapper<T>>() {
                     if let Some(ref inner) = wrapper.inner {
                         results.push(inner.clone());
@@ -235,24 +187,25 @@ impl AppCoreUtil {
 
     /// 按 trait + name 获取组件 → `Arc<dyn Trait>`
     ///
-    /// 从 `TRAIT_OBJ_CACHE` 中取出预计算好的裸指针，
-    /// 通过 `Arc::from_raw` 重建 `Arc<dyn Trait>`，
-    /// clone 后更新缓存中的指针。
+    /// 从 `TRAIT_OBJ_CACHE` 取出 `TraitObjectEntry`，用注册时记录的 dyn Trait
+    /// 真实 vtable 与实例数据指针拼回 fat pointer，重建 `Arc<dyn Trait>`。
+    /// vtable 是 accessor 内 coercion 时编译器算出的真实值，与缓存条目同源
+    /// （同一注册条目的 trait_type_id + accessor）。
     ///
     /// # Safety
     ///
-    /// 内部使用 unsafe 将裸指针重建为 `Arc<dyn Trait>`。
+    /// 内部使用 unsafe 将拆解后的 fat pointer 位重新拼回 `Arc<dyn Trait>`。
     /// 安全性由以下不变量保证：
-    /// - 指针由 `Arc::into_raw` 在 `populate_trait_obj_cache` 中创建
-    /// - 指针类型与 `Trait` 泛型参数匹配（由 `TraitImplRegistration` 的 trait_type_id 保证）
-    /// - 每次取出后 clone 一份，原指针放回缓存
+    /// - data 指针由 `Arc::into_raw` 在取用侧创建（指向 ArcInner）
+    /// - vtable 是注册时 coercion 生成的 dyn Trait 真实 vtable（'static 只读静态数据），
+    ///   其 [drop, size, align] 头三槽与该具体类型一致，`Arc::from_raw` 的 drop 行为正确
     pub fn get_component_by_trait_and_name<Trait: Injectable + ?Sized>(
         name: &str,
     ) -> Result<Arc<Trait>, ComponentError> {
         let trait_type_id = TypeId::of::<Trait>();
         let cache_key = (trait_type_id, name.to_string());
 
-        let arc_injectable = TRAIT_OBJ_CACHE
+        let entry = TRAIT_OBJ_CACHE
             .get(&cache_key)
             .ok_or_else(|| ComponentError::TraitImplNotFound {
                 trait_name: std::any::type_name::<Trait>().to_string(),
@@ -260,24 +213,22 @@ impl AppCoreUtil {
             .value()
             .clone();
 
-        // 将 Arc<dyn Injectable> 转为裸指针，再通过 transmute_copy 转为目标 trait 的裸指针
-        let ptr_injectable: *const dyn Injectable = Arc::into_raw(arc_injectable);
-        // SAFETY: *const dyn Injectable 和 *const Trait 都是 fat pointer（128 bits on 64-bit），
-        // 二进制布局相同（data_ptr + vtable_ptr）。
-        // Trait: Injectable 保证 vtable 兼容 —— dyn Trait 的 vtable 包含了 dyn Injectable 的方法。
+        // 拆出 data 指针（ArcInner），与注册时记录的 dyn Trait 真实 vtable 拼回 fat pointer
+        let ptr_injectable: *const dyn Injectable = Arc::into_raw(entry.obj);
+        // SAFETY: fat pointer 位拆解（data + vtable 两段 usize），仅观察用途
+        let bits: [usize; 2] = unsafe { std::mem::transmute_copy(&ptr_injectable) };
+        // SAFETY: 拼出的 fat pointer 与编译器 upcast 产物位级相同——data 来自
+        // `Arc::into_raw`，vtable 是 coercion 生成的真实 dyn Trait vtable，满足
+        // `Arc::from_raw` 契约（head 三槽 drop/size/align 与该具体类型一致）。
         let ptr_trait: *const Trait =
-            unsafe { std::mem::transmute_copy::<*const dyn Injectable, *const Trait>(&ptr_injectable) };
-        // SAFETY: ptr_trait 由 Arc::into_raw 创建的指针经 transmute 得到，类型匹配
+            unsafe { std::mem::transmute_copy(&[bits[0], entry.vtable as usize]) };
         Ok(unsafe { Arc::from_raw(ptr_trait) })
     }
 
     /// 按 trait 获取唯一实现 → `Arc<dyn Trait>`
     ///
-    /// 从 `INSTANCE_NAMES_BY_TRAIT`（`populate_trait_obj_cache` 时填充）
-    /// 直接获取该 trait 的所有实例名，要求恰好一个。
-    ///
-    /// **不扫描 `COMPONENT_REPOSITORY`**，避免 create 阶段的死锁：
-    /// create 持有 `get_mut` 写锁，遍历 `COMPONENT_REPOSITORY.iter()` 会阻塞在同一 shard。
+    /// 通过 trait 实现索引（`get_impl_component_names_by_trait`）
+    /// 获取该 trait 的所有实例名，要求恰好一个。
     ///
     /// 错误：
     /// - 0 个实现类型 → `TraitImplNotFound`
@@ -287,13 +238,7 @@ impl AppCoreUtil {
         let trait_type_id = TypeId::of::<Trait>();
         let trait_name = std::any::type_name::<Trait>().to_string();
 
-        let instance_names = INSTANCE_NAMES_BY_TRAIT
-            .get(&trait_type_id)
-            .ok_or_else(|| ComponentError::TraitImplNotFound {
-                trait_name: trait_name.clone(),
-            })?;
-
-        let names = instance_names.value();
+        let names = get_impl_component_names_by_trait(trait_type_id);
         if names.is_empty() {
             return Err(ComponentError::TraitImplNotFound { trait_name });
         }
@@ -309,10 +254,8 @@ impl AppCoreUtil {
 
     /// 按 trait 获取所有实现 → `Vec<Arc<dyn Trait>>`
     ///
-    /// 从 `INSTANCE_NAMES_BY_TRAIT` 直接获取该 trait 的所有实例名，
-    /// 逐个从 `TRAIT_OBJ_CACHE` 取出。
-    ///
-    /// **不扫描 `COMPONENT_REPOSITORY`**，避免 create 阶段的死锁。
+    /// 通过 trait 实现索引 + 仓库扫描（`get_impl_component_names_by_trait`）
+    /// 获取该 trait 的所有实例名，逐个从 `TRAIT_OBJ_CACHE` 取出。
     ///
     /// 如果 trait 没有实现类型或所有实例都未被缓存，返回空 Vec。
     pub fn get_components_by_trait<Trait: Injectable + ?Sized>(
@@ -320,14 +263,8 @@ impl AppCoreUtil {
         let trait_type_id = TypeId::of::<Trait>();
         let trait_name = std::any::type_name::<Trait>().to_string();
 
-        let instance_names = INSTANCE_NAMES_BY_TRAIT
-            .get(&trait_type_id)
-            .ok_or_else(|| ComponentError::TraitImplNotFound {
-                trait_name: trait_name.clone(),
-            })?;
-
         let mut results = Vec::new();
-        for name in instance_names.value().iter() {
+        for name in get_impl_component_names_by_trait(trait_type_id).iter() {
             match Self::get_component_by_trait_and_name::<Trait>(name) {
                 Ok(entry) => results.push(entry),
                 Err(_) => {

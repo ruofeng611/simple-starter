@@ -2,7 +2,9 @@ mod core {
     pub(crate) mod component_macro;
     pub(crate) mod configuration_macro;
     pub(crate) mod cron_job_macro;
+    pub(crate) mod event_listener_macro;
     pub(crate) mod injectable_macro;
+    pub(crate) mod primary_macro;
     pub(crate) mod provider_macro;
 }
 
@@ -90,6 +92,28 @@ pub fn provider(args: TokenStream, item: TokenStream) -> TokenStream {
     core::provider_macro::provider_macro(args, item)
 }
 
+/// 标记首要（primary）实例。
+///
+/// 必须与 `#[provider]` 一起标注在同一函数上，声明该函数返回值类型的首要实例：
+/// 当框架按类型获取组件时优先返回它（见 `AppCoreUtil::get_primary_component`）。
+/// 由于存在 primary 通常意味着同类型有多个实例，因此必须显式指定实例名，
+/// 且该名字必须与 `#[provider]` 注册的组件名一致。
+///
+/// 用法：
+/// ```rust
+/// #[provider(name = "mainRedis")]
+/// #[primary(name = "mainRedis")]
+/// pub fn main_redis() -> anyhow::Result<redis::Client> {
+///     Ok(redis::Client::open("redis://main")?)
+/// }
+/// ```
+///
+/// 也支持位置参数简写：`#[primary("mainRedis")]`。
+#[proc_macro_attribute]
+pub fn primary(args: TokenStream, item: TokenStream) -> TokenStream {
+    core::primary_macro::primary_macro(args, item)
+}
+
 /// 定义一个配置组件。
 ///
 /// 该宏将结构体注册为配置组件，字段自动绑定 TOML 配置路径。
@@ -138,6 +162,40 @@ pub fn inject(_args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn cron_job(args: TokenStream, item: TokenStream) -> TokenStream {
     core::cron_job_macro::cron_job_macro(args, item)
+}
+
+/// 注册事件监听器。
+///
+/// 作用在 `impl EventListener<E> for Type` 块上，将实现组件注册为该事件类型的监听器：
+/// 发布器（默认 `DefaultEventPublisher`）在 init 阶段自动收集，事件发布时同步广播。
+/// 同时生成 trait 实现映射，`#[inject] Vec<Arc<dyn EventListener<E>>>` 可正常注入。
+///
+/// 用法：
+/// ```rust
+/// #[component]
+/// pub struct UserService { ... }
+///
+/// #[event_listener]
+/// #[async_trait::async_trait]
+/// impl EventListener<UserLoginEvent> for UserService {
+///     async fn on_event(&self, event: &UserLoginEvent) -> anyhow::Result<()> {
+///         // 处理登录事件
+///         Ok(())
+///     }
+/// }
+/// ```
+///
+/// 注意：
+/// - 必须搭配 `#[component]` 标注的结构体使用（监听器需是已注册组件）；
+///   发布器 init 阶段收集全部监听器组件，监听器由组件仓库强持有至应用结束。
+#[proc_macro_attribute]
+pub fn event_listener(args: TokenStream, item: TokenStream) -> TokenStream {
+    let item_impl = match syn::parse2::<syn::ItemImpl>(item.into()) {
+        Ok(impl_block) => impl_block,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    core::event_listener_macro::event_listener_on_impl(args, item_impl)
+        .unwrap_or_else(|e| e.to_compile_error().into())
 }
 
 // =============================================================================

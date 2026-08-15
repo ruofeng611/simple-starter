@@ -1,10 +1,11 @@
 [package]
 name = "simple-starter-security"
-version = "1.0.0"
+version = "2.0.0"
 edition = "2024"
 
 [dependencies]
 simple-starter-core = { path = "../simple-starter-core" }
+simple-starter-macro = { path = "../simple-starter-macro" }
 simple-starter-web = { path = "../simple-starter-web" }
 serde_json = { workspace = true }
 inventory = { workspace = true }

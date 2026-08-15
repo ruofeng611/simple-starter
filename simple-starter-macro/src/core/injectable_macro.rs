@@ -35,15 +35,25 @@ pub(crate) fn injectable_on_impl(_args: TokenStream, item_impl: ItemImpl) -> syn
                 trait_type_id: ::std::any::TypeId::of::<dyn #trait_type>(),
                 impl_type_id: ::std::any::TypeId::of::<#impl_type>(),
                 accessor: |arc_any: ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>|
-                    -> ::std::option::Option<::std::sync::Arc<dyn ::simple_starter_core::Injectable>>
+                    -> ::std::option::Option<::simple_starter_core::TraitObjectEntry>
                 {
                     let arc: ::std::sync::Arc<#impl_type> = arc_any.downcast::<#impl_type>().ok()?;
-                    // 先 coerce 到 dyn Trait（完整 vtable），再向上 coerce 到 dyn Injectable
-                    // 确保 vtable 基址 = Trait vtable，后续 transmute 回 Trait 才是正确的
+                    // 先 coerce 到 dyn Trait（完整 vtable）
                     let arc_trait: ::std::sync::Arc<dyn #trait_type> = arc;
-                    ::std::option::Option::Some(
-                        arc_trait as ::std::sync::Arc<dyn ::simple_starter_core::Injectable>,
-                    )
+                    // 拆出 coercion 生成的 dyn Trait 真实 vtable（'static 只读静态数据），
+                    // 取用侧按该 vtable 拼回 fat pointer，不依赖 vtable 布局假设。
+                    let vtable = {
+                        let raw = ::std::sync::Arc::into_raw(arc_trait.clone());
+                        // SAFETY: fat pointer 位拆解（data + vtable 两段 usize），仅观察用途
+                        let bits: [usize; 2] = unsafe { ::std::mem::transmute_copy(&raw) };
+                        // SAFETY: 与 `Arc::into_raw` 配对收回，计数复原
+                        let _ = unsafe { ::std::sync::Arc::from_raw(raw) };
+                        bits[1] as *const ()
+                    };
+                    ::std::option::Option::Some(::simple_starter_core::TraitObjectEntry {
+                        obj: arc_trait as ::std::sync::Arc<dyn ::simple_starter_core::Injectable>,
+                        vtable,
+                    })
                 },
             }
         }

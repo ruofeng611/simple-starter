@@ -19,13 +19,12 @@ use simple_starter_core::anyhow::Context;
 use simple_starter_core::tracing::{Level, info};
 use simple_starter_core::{anyhow, AppCoreUtil};
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 
 /// 构建并启动 Web 服务。
 ///
-/// 该函数在应用核心后台任务中被调用，此时所有插件的 `init` 与 `post_init` 已完成，
+/// 该函数在应用核心后台任务中被调用，此时所有插件的 `assemble`、`components_ready` 与 `finalize` 已完成，
 /// 扩展注册表已被完全填充。
 pub(crate) async fn build_and_serve(
     web_config: WebConfig,
@@ -36,12 +35,12 @@ pub(crate) async fn build_and_serve(
     // === 阶段 1: 构建基础路由 ===
     let mut router = Router::new();
 
-    // 1.1 合并 inventory 自动收集的路由
+    // 合并 inventory 自动收集的路由
     for route_factory in inventory::iter::<RouteFactory> {
         router = router.merge((route_factory.router)());
     }
 
-    // 1.2 合并手动注册的路由
+    // 合并手动注册的路由
     for factory in manual_routers {
         router = router.merge(factory());
     }
@@ -91,14 +90,11 @@ pub(crate) async fn build_and_serve(
             )
         })?;
 
-    let listener = if let Some(factory) = registry.take_listener_factory() {
-        info!("Using custom listener factory (e.g., TLS/UDS)");
-        factory(&web_config.binding, web_config.port).await?
-    } else {
-        TcpListener::bind(&addr)
-            .await
-            .context("Failed to bind TCP listener")?
-    };
+    // 监听器工厂由 WebPlugin 在收尾期从组件仓库获取后注入（默认直连绑定或用户覆盖实现）
+    let factory = registry
+        .take_listener_factory()
+        .context("TcpListenerFactory component not registered")?;
+    let listener = factory.bind(&web_config.binding, web_config.port).await?;
 
     let scheme = registry.server_scheme();
     info!("Server listening on {}://{}", scheme, addr);

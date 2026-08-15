@@ -341,6 +341,8 @@ impl Application {
     }
 
     /// 初始化日志系统
+    ///
+    /// 构建顺序：基础 Filter → 时间格式与时区 → 内置控制台/文件层 → 用户自定义层。
     fn init_tracing(&mut self) -> anyhow::Result<()> {
         let logger_config: LoggerConfig = AppCoreUtil::get_config_to_struct("logger")?;
 
@@ -351,12 +353,11 @@ impl Application {
             .with_default_directive(log_level.into()) // 如果没有 RUST_LOG，就用这个
             .from_env_lossy(); // 尝试读取 RUST_LOG，如果格式不对不报错，而是忽略环境变量
 
-        // 2. 内置格式化器，其和内置控制台与文件输出绑定
-        // 2.1. 定义格式
+        // 2. 定义时间格式
         let time_fmt = format_description!(
             "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]"
         );
-        // 2.2. 决定时区
+        // 3. 决定时区
         let offset = if let Some(tz_str) = &logger_config.timezone {
             // 如果配置了，尝试解析 "+08:00"
             UtcOffset::parse(
@@ -369,7 +370,7 @@ impl Application {
             UtcOffset::UTC
         };
 
-        // 2.3. 创建 Timer
+        // 4. 创建 Timer
         let timer = OffsetTime::new(offset, time_fmt);
         let format_base = fmt::format()
             .with_timer(timer)
@@ -377,7 +378,7 @@ impl Application {
             .with_thread_names(logger_config.with_thread_name)
             .compact();
 
-        // 3. 构建内置的控制台层
+        // 5. 构建内置的控制台层
         let console_layer = if logger_config.enable_console {
             Some(
                 fmt::layer()
@@ -388,12 +389,12 @@ impl Application {
             None
         };
 
-        // 4. 构建内置的文件层 (按天滚动)
+        // 6. 构建内置的文件层 (按天滚动)
         let file_layer = if let Some(dir) = &logger_config.log_dir {
-            // A. 确保目录存在
+            // 确保目录存在
             std::fs::create_dir_all(dir).context("Failed to create log dir")?;
 
-            // B. 配置按天滚动 (Daily Rolling)
+            // 配置按天滚动 (Daily Rolling)
             // 文件名为: <dir>/<name>.YYYY-MM-DD (例如 logs/app.log.2023-10-27)
             let file_appender = rolling::Builder::new()
                 .rotation(rolling::Rotation::DAILY)
@@ -419,7 +420,7 @@ impl Application {
 
         let effective_level_str = filter_layer.to_string();
 
-        // 5. 如果有自定义的日志层，则创建后添加
+        // 7. 如果有自定义的日志层，则创建后添加
         let mut log_layers_vec: Vec<Box<dyn Layer<Registry> + Send + Sync>> = Vec::new();
         for log_layers_factory in self.log_layers_factory.drain(..) {
             log_layers_vec.push(log_layers_factory());
@@ -458,7 +459,7 @@ impl Application {
             let thread_name = runtime_config.worker_thread_name;
 
             let rt = match runtime_config.worker_thread_num {
-                Some(n) if n <= 0 => {
+                Some(n) if n == 0 => {
                     return Err(anyhow!("worker_thread_num must be > 0, got: {}", n));
                 }
                 // 当线程数为1并且没有自定义的主循环时创建单线程运行时
@@ -572,7 +573,13 @@ impl Application {
         Ok(())
     }
 
-    /// 启动方法，引导阶段：插件排序 → 插件 init → 组件加载 → 插件 post_init → 启动钩子
+    /// 启动方法（引导阶段），按序执行：
+    /// 1. 插件拓扑排序（依赖先于依赖者）
+    /// 2. 插件 assemble：组件加载前装配扩展注册表
+    /// 3. 组件加载：注册 → DFS 创建 → 统一初始化
+    /// 4. 插件 components_ready：获取组件、注入协作结构
+    /// 5. 插件 finalize：消费注册表、构建并启动服务
+    /// 6. 启动钩子
     fn start(&mut self) -> anyhow::Result<()> {
         // 1. 插件排序（同步）
         if !self.plugins.is_empty() {
@@ -591,38 +598,17 @@ impl Application {
         let app = &mut *self;
 
         let result = rt.block_on(async move {
-            // 2.1 插件 init
+            // 3. 插件 assemble（装配期：装配扩展注册表）
             for plugin in plugins.iter_mut() {
-                match plugin.init(app).await {
+                match plugin.assemble(app).await {
                     Ok(_) => {
                         if plugin.should_log() {
-                            info!("Plugin initialized: [{}]", plugin.name());
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow!("Plugin '{}' init failed: {:?}", plugin.name(), e));
-                    }
-                }
-            }
-
-            // 2.2 组件加载 (Inventory 模式)
-            if has_inventory_components {
-                if let Err(e) = component_repository_load().await {
-                    return Err(anyhow!("Component repository load failed: {:?}", e));
-                }
-            }
-
-            // 2.3 插件 post_init
-            for plugin in plugins.iter_mut() {
-                match plugin.post_init(app).await {
-                    Ok(_) => {
-                        if plugin.should_log() {
-                            info!("Plugin post-initialized: [{}]", plugin.name());
+                            info!("Plugin assembled: [{}]", plugin.name());
                         }
                     }
                     Err(e) => {
                         return Err(anyhow!(
-                            "Plugin '{}' post_init failed: {:?}",
+                            "Plugin '{}' assemble failed: {:?}",
                             plugin.name(),
                             e
                         ));
@@ -630,7 +616,50 @@ impl Application {
                 }
             }
 
-            // 2.4 启动钩子
+            // 4. 组件加载 (Inventory 模式)
+            if has_inventory_components {
+                if let Err(e) = component_repository_load().await {
+                    return Err(anyhow!("Component repository load failed: {:?}", e));
+                }
+            }
+
+            // 5. 插件 components_ready（组件就绪期：获取组件、注入协作结构）
+            for plugin in plugins.iter_mut() {
+                match plugin.components_ready(app).await {
+                    Ok(_) => {
+                        if plugin.should_log() {
+                            info!("Plugin components ready: [{}]", plugin.name());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Plugin '{}' components_ready failed: {:?}",
+                            plugin.name(),
+                            e
+                        ));
+                    }
+                }
+            }
+
+            // 6. 插件 finalize（收尾期：消费注册表、构建并启动服务）
+            for plugin in plugins.iter_mut() {
+                match plugin.finalize(app).await {
+                    Ok(_) => {
+                        if plugin.should_log() {
+                            info!("Plugin finalized: [{}]", plugin.name());
+                        }
+                    }
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Plugin '{}' finalize failed: {:?}",
+                            plugin.name(),
+                            e
+                        ));
+                    }
+                }
+            }
+
+            // 7. 启动钩子
             if !startup_hooks.is_empty() {
                 for hook in startup_hooks.drain(..) {
                     if let Err(e) = hook.await {

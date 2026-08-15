@@ -4,7 +4,12 @@ use toml::Value;
 
 /// 插件 Trait
 ///
-/// 允许扩展系统功能，插件会在组件加载完毕后初始化。
+/// 允许扩展系统功能。插件生命周期按职责划分为三个周期（均按插件拓扑顺序执行）：
+///
+/// 1. `assemble`（装配期）：组件加载前，用于装配扩展注册表。
+/// 2. `components_ready`（组件就绪期）：组件全部创建并初始化完成后，用于获取组件实例、
+///    注入插件协作结构、执行组件启动后配置。
+/// 3. `finalize`（收尾期）：所有插件协作完毕后，用于消费扩展注册表、构建并启动服务。
 #[async_trait]
 pub trait Plugin: Send {
     /// 插件唯一名称
@@ -20,16 +25,26 @@ pub trait Plugin: Send {
         Value::Table(toml::value::Table::new())
     }
 
-    /// 初始化插件
+    /// 装配插件
     ///
-    /// 在此处可以访问 `Application` 上下文，添加任务。
-    async fn init(&mut self, ctx: &mut Application) -> anyhow::Result<()>;
+    /// 组件加载前的唯一窗口。在此处将扩展注册表放入
+    /// `Application` 上下文，供其他插件继续填充。
+    async fn assemble(&mut self, ctx: &mut Application) -> anyhow::Result<()>;
 
-    /// 后置初始化钩子（可选）
+    /// 组件就绪钩子（可选）
     ///
-    /// 在所有插件的 `init` 都执行完毕后，按拓扑顺序调用。
-    /// 适合需要在其他插件初始化完成后再进行的操作，例如消费由其他插件注册的扩展。
-    async fn post_init(&mut self, _ctx: &mut Application) -> anyhow::Result<()> {
+    /// 在组件仓库加载（create + init）完成后、`finalize` 之前按拓扑顺序调用。
+    /// 此时组件已定型，适合获取组件实例（含条件注册的默认实现与用户覆盖）、
+    /// 构建依赖组件的插件协作结构（如中间件状态）。
+    async fn components_ready(&mut self, _ctx: &mut Application) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// 收尾钩子（可选）
+    ///
+    /// 在所有插件的 `assemble` 与 `components_ready` 都执行完毕后，按拓扑顺序调用。
+    /// 适合消费由其他插件填充完毕的扩展注册表、构建并启动服务。
+    async fn finalize(&mut self, _ctx: &mut Application) -> anyhow::Result<()> {
         Ok(())
     }
 

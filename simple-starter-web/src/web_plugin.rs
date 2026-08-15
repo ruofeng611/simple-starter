@@ -1,5 +1,5 @@
 use crate::config::web_config::WebConfig;
-use crate::web_extension::WebExtensionRegistry;
+use crate::web_extension::{TcpListenerFactory, WebExtensionRegistry};
 use async_trait::async_trait;
 use axum::Router;
 use simple_starter_core::anyhow::Context;
@@ -10,11 +10,21 @@ use toml::Value;
 ///
 /// 负责集成 Axum Web 框架，自动发现并注册路由，启动 HTTP 服务。
 ///
-/// # 两阶段初始化
+/// # 使用方式
+/// 在 `Application` 上注册即可自动启动 HTTP 服务：
 ///
-/// - `init`: 创建 `WebExtensionRegistry` 并放入 `Application` 扩展上下文，
+/// ```ignore
+/// simple_starter_core::Application::new()
+///     .register_plugin(WebPlugin::new())
+///     .run();
+/// ```
+///
+/// # 三阶段生命周期
+///
+/// - `assemble`: 创建 `WebExtensionRegistry` 并放入 `Application` 扩展上下文，
 ///   供其他依赖 WebPlugin 的插件注册中间件、路由修改器等扩展。
-/// - `post_init`: 在所有插件的 `init` 执行完毕后，消费注册表并构建/启动服务。
+/// - `finalize`: 在所有插件装配与组件就绪完毕后，从组件仓库获取 [`TcpListenerFactory`]
+///   并消费注册表，注册延迟构建的后台任务。
 pub struct WebPlugin {
     manual_router_factory: Vec<Box<dyn FnOnce() -> Router + Send>>,
     registry: WebExtensionRegistry,
@@ -62,19 +72,6 @@ impl WebPlugin {
         self
     }
 
-    /// 设置自定义监听器工厂（用户自定义扩展）
-    ///
-    /// 典型用途：实现 TLS/HTTPS、Unix Domain Socket 等。
-    /// 设置后建议同时调用 `set_server_scheme("https")` 以修正日志输出。
-    pub fn set_listener_factory<F, Fut>(mut self, factory: F) -> Self
-    where
-        F: FnOnce(&str, u16) -> Fut + Send + 'static,
-        Fut: Future<Output = simple_starter_core::anyhow::Result<tokio::net::TcpListener>> + Send + 'static,
-    {
-        self.registry.set_listener_factory(factory);
-        self
-    }
-
     /// 设置服务协议前缀（影响启动日志）
     ///
     /// 默认值为 `"http"`，若启用了 TLS，建议设置为 `"https"`。
@@ -100,22 +97,22 @@ impl Plugin for WebPlugin {
         Value::Table(table)
     }
 
-    /// 初始化阶段
+    /// 装配期
     ///
     /// 将 `WebPlugin` 自身的 `WebExtensionRegistry` 移入 `Application` 扩展上下文，
     /// 供其他依赖 WebPlugin 的插件继续注册扩展。
-    async fn init(&mut self, ctx: &mut Application) -> simple_starter_core::anyhow::Result<()> {
+    async fn assemble(&mut self, ctx: &mut Application) -> simple_starter_core::anyhow::Result<()> {
         let registry = std::mem::take(&mut self.registry);
         ctx.insert_extension(registry);
         Ok(())
     }
 
-    /// 后置初始化阶段
+    /// 收尾期
     ///
-    /// 此时所有插件的 `init` 已完成，扩展注册表已被填充（包含用户在 `new()` 阶段
-    /// 注册的扩展以及其他插件通过 `Application` 上下文注册的扩展）。
-    /// 消费注册表、构建 Router、注册后台任务。
-    async fn post_init(
+    /// 此时所有插件的 `assemble` 与 `components_ready` 已完成，扩展注册表已被填充
+    /// （包含用户在 `new()` 阶段注册的扩展以及其他插件通过 `Application` 上下文注册的扩展）。
+    /// 从组件仓库获取监听器工厂、消费注册表、注册后台任务。
+    async fn finalize(
         &mut self,
         ctx: &mut Application,
     ) -> simple_starter_core::anyhow::Result<()> {
@@ -127,11 +124,16 @@ impl Plugin for WebPlugin {
         let manual_router_factory = std::mem::take(&mut self.manual_router_factory);
 
         // 3. 从应用上下文中消费扩展注册表
-        let registry = ctx
+        let mut registry = ctx
             .remove_extension::<WebExtensionRegistry>()
             .context("WebExtensionRegistry not found in application context")?;
 
-        // 4. 注册延迟构建的后台任务
+        // 4. 从组件仓库获取监听器工厂（默认实现经条件注册保证存在，用户实现存在时自动退位）
+        let listener_factory = AppCoreUtil::get_component_by_trait::<dyn TcpListenerFactory>()
+            .context("TcpListenerFactory component not found in component repository")?;
+        registry.set_listener_factory(listener_factory);
+
+        // 5. 注册延迟构建的后台任务
         ctx.add_task_spawn_factory_in_context(move |cancel_token| async move {
             crate::server_builder::build_and_serve(
                 web_config,

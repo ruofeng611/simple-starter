@@ -1,20 +1,23 @@
-use std::any::TypeId;
+use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{Layer, Registry};
-use crate::core::app_component::Injectable;
+use crate::core::app_component::TraitObjectEntry;
 
 /// trait object 访问器函数签名
 ///
 /// 输入: `Arc<dyn Any + Send + Sync>`（组件实例的类型擦除形式）
-/// 输出: `Option<Arc<dyn Injectable>>`（通过 upcasting coercion 转换的 trait object）
+/// 输出: `Option<TraitObjectEntry>`（coerce 后的 trait object + 还原用 vtable）
 /// 由 `#[component]` on impl 块宏在编译期生成，已知具体类型和 trait，直接做类型转换。
-pub type TraitObjAccessorFn = fn(Arc<dyn std::any::Any + Send + Sync>) -> Option<Arc<dyn Injectable>>;
+pub type TraitObjAccessorFn =
+    fn(Arc<dyn Any + Send + Sync>) -> Option<TraitObjectEntry>;
 
-/// 组件唯一标识符：由类型 ID 和 自定义名称组成
-pub type ComponentKey = (TypeId, String);
+/// 组件唯一标识符：组件名（全局唯一，含跨具体类型）
+///
+/// 组件类型信息由 `ComponentProcessor::type_id()` 从实例派生，key 仅承载名字。
+pub type ComponentKey = String;
 
 /// 异步 Future 的装箱类型
 ///
@@ -30,12 +33,16 @@ pub type CreateFn<T> = Box<dyn FnOnce() -> BoxFuture<anyhow::Result<T>> + Send +
 
 /// 组件初始化函数签名
 ///
-/// 接收组件的 Arc 引用，允许初始化逻辑中引用自身或进行异步操作。
+/// 接收组件的共享引用 `Arc<T>`（对应 `async fn init(&self)` 方法签名）：
+/// init 阶段组件实例仍由组件仓库持有，初始化逻辑仅能读取/借用自身，不能消费。
 pub type InitFn<T> = Box<dyn FnOnce(Arc<T>) -> BoxFuture<anyhow::Result<()>> + Send + Sync>;
 
 /// 组件销毁函数签名
 ///
-/// 接收组件的所有权（T），用于清理资源。
+/// 接收「有所有权」的组件实例 `T`（对应 `async fn destroy(self)` 方法签名）：
+/// 与 init 的共享引用不同，销毁阶段所有权已从仓库移出，
+/// 方法内可消费字段、取出内部资源。要求调用前 Arc 引用计数为 1
+/// （见 `ComponentWrapper::destroy` 的 `Arc::try_unwrap`）。
 pub type DestroyFn<T> = Box<dyn FnOnce(T) -> BoxFuture<anyhow::Result<()>> + Send + Sync>;
 
 /// Tokio 运行时工厂函数签名

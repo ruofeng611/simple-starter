@@ -117,7 +117,7 @@ fn security_on_fn(args: SecurityArgs, func: ItemFn) -> TokenStream {
     let module_name = args.module_name.unwrap_or_default();
 
     let register = quote! {
-        ::simple_starter_security::submit! {
+        ::simple_starter_core::submit! {
             ::simple_starter_security::ResourceEntry {
                 path_pattern: #path,
                 resource_id: #resource_id,

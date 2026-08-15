@@ -113,6 +113,34 @@ pub(crate) fn parse_and_strip_inject(attrs: &mut Vec<Attribute>) -> (bool, Optio
     (is_injected, inject_name)
 }
 
+/// 解析并移除字段或参数上的 `#[inject_primary]` 属性。
+///
+/// # 语义
+/// 标记该字段/参数按 primary（首要实例）获取，仅适用于 `Arc<ConcreteType>`
+/// 具体类型（trait 类型由调用方宏在解析类型后编译报错）。
+/// 与 `#[inject]` 互斥，单独使用即隐含注入语义。
+///
+/// # 返回值
+/// - `bool`: 是否存在 `#[inject_primary]` 属性。
+pub(crate) fn parse_and_strip_inject_primary(attrs: &mut Vec<Attribute>) -> bool {
+    let mut is_primary = false;
+    let mut indices_to_remove = Vec::new();
+
+    for (i, attr) in attrs.iter().enumerate() {
+        if attr.path().is_ident("inject_primary") {
+            is_primary = true;
+            indices_to_remove.push(i);
+        }
+    }
+
+    // 倒序移除，防止索引偏移
+    for i in indices_to_remove.into_iter().rev() {
+        attrs.remove(i);
+    }
+
+    is_primary
+}
+
 /// 组合基础路径和方法路径。
 ///
 /// 用于 `rest_controller` 和 `security_controller` 宏中拼接完整路由路径。
@@ -190,4 +218,28 @@ pub(crate) fn is_vec_arc_dyn_trait(ty: &Type) -> bool {
 /// 将 `TypeTraitObject` 转回 `Type`（用于代码生成中的 turbofish）
 pub(crate) fn trait_object_to_type(trait_obj: &TypeTraitObject) -> Type {
     Type::TraitObject(trait_obj.clone())
+}
+
+/// 尝试从 `Result<T, E>` 或 `anyhow::Result<T>` 中提取 T
+///
+/// 逻辑：
+/// 1. 检查是否为 Path 类型。
+/// 2. 检查最后一个段是否为 "Result"。
+/// 3. 获取尖括号内的第一个泛型参数作为类型。
+///
+/// 供 `#[provider]` / `#[primary]` 宏复用，解析函数返回值中的组件类型。
+pub(crate) fn get_result_inner_type(ty: &Type) -> Option<&Type> {
+    if let Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            if segment.ident == "Result" {
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    // Result<T> 或 Result<T, E>，我们只需要第一个参数 T
+                    if let Some(GenericArgument::Type(inner_ty)) = args.args.first() {
+                        return Some(inner_ty);
+                    }
+                }
+            }
+        }
+    }
+    None
 }

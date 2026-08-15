@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 use crate::TraitObjAccessorFn;
+use crate::loaders::component_condition::ComponentCondition;
 
 /// 组件处理器 Trait
 ///
@@ -13,9 +14,15 @@ pub trait ComponentProcessor: Any + Send + Sync {
     async fn create(&mut self) -> anyhow::Result<()>;
 
     /// 阶段二：初始化（可以安全地获取并使用其他依赖组件）
+    ///
+    /// 与 destroy 不同：init 以 `Arc<T>` 共享引用调用用户方法（`async fn init(&self)`），
+    /// 组件实例仍由组件仓库持有，方法内仅能读取/借用自身，不能消费。
     async fn init(&mut self) -> anyhow::Result<()>;
 
     /// 阶段三：销毁（清理资源）
+    ///
+    /// 与 init 不同：destroy 以「有所有权」的实例 `T` 调用用户方法（`async fn destroy(self)`），
+    /// 实例所有权已从仓库移出，方法内可消费字段、取出内部资源。
     async fn destroy(&mut self) -> anyhow::Result<()>;
 
     /// 用于类型转换
@@ -26,9 +33,15 @@ pub trait ComponentProcessor: Any + Send + Sync {
     /// 仅在 `create` 完成后才返回 `Some`。
     /// 返回 `Arc<dyn Any + Send + Sync>`，可以 `downcast` 回具体类型。
     fn get_inner_arc_any(&self) -> Option<Arc<dyn Any + Send + Sync>>;
+
+    /// 获取组件实例的具体类型
+    ///
+    /// 类型信息由实例本身派生（而非注册元数据），是组件类型的单一事实来源，
+    /// 供 trait 依赖展开与按类型查询使用。
+    fn type_id(&self) -> TypeId;
 }
 
-/// 所有可注入 trait 的 supertrait
+/// 所有可注入 trait 的 super_trait
 ///
 /// 要求 trait object 必须满足 `Any + Send + Sync`，
 /// 从而能够将 `Arc<dyn Trait>` 擦除为 `Arc<dyn Injectable>` 存入统一存储。
@@ -36,16 +49,55 @@ pub trait ComponentProcessor: Any + Send + Sync {
 pub trait Injectable: Any + Send + Sync {}
 impl<T: Any + Send + Sync> Injectable for T {}
 
+/// trait object 缓存条目：类型擦除对象 + 还原用 vtable
+///
+/// trait 还原原理：Rust 的 trait object 是「数据指针 + vtable 指针」组成的 fat pointer，
+/// vtable 布局属未规范化的实现细节，无法仅凭 `Arc<dyn Injectable>` 安全还原出
+/// `Arc<dyn Trait>`。因此本条目在写入缓存时（accessor 内 upcasting coercion 的瞬间）
+/// 记录编译器算出的 dyn Trait 真实 vtable 指针（'static 只读静态数据）；
+/// 取用侧用「数据指针 + 记录的 vtable」拼回 fat pointer 即可安全还原，
+/// 不依赖任何 vtable 布局假设。
+pub struct TraitObjectEntry {
+    /// 类型擦除后的组件 trait object（缓存中的持有者）
+    pub obj: Arc<dyn Injectable>,
+    /// coercion 生成的 dyn Trait 真实 vtable 指针（'static 只读静态数据）
+    pub vtable: *const (),
+}
+
+impl Clone for TraitObjectEntry {
+    fn clone(&self) -> Self {
+        Self {
+            obj: self.obj.clone(),
+            vtable: self.vtable,
+        }
+    }
+}
+
+// SAFETY: `vtable` 指向编译器生成的 vtable 静态数据：只读、'static、无释放义务、
+// 不携带所有权，仅作还原用的元数据指针；`obj` 本身 `Send + Sync`。
+// 跨线程共享（存入 `DashMap` 缓存）安全。
+unsafe impl Send for TraitObjectEntry {}
+unsafe impl Sync for TraitObjectEntry {}
+
 /// 组件工厂结构体
 ///
-/// 用于 `inventory` 收集，存储组件的元数据和构造逻辑。
+/// 由 `#[component]` 等宏生成并经 `inventory` 收集，存储组件的元数据与构造逻辑。
+/// 构造器返回 `Box<dyn ComponentProcessor>`（内部为 `ComponentWrapper<T>`）。
 pub struct ComponentProcessorFactory {
     pub dependencies: &'static [&'static str],
-    /// trait 依赖：编译期生成的函数指针，运行时返回依赖的 trait 的 TypeId
+    /// trait 依赖：直接存储 `TypeId::of::<dyn Trait>()`（const fn，static 初始化中直接求值）
     /// 用于拓扑排序中直接通过 TypeId 查找 trait 实现，无需字符串中转
-    pub trait_dependencies: &'static [fn() -> TypeId],
+    pub trait_dependencies: &'static [TypeId],
+    /// 具体类型依赖：直接存储 `TypeId::of::<ConcreteType>()`（const fn 直接求值）
+    /// 无名称注入 `Arc<T>` 时使用（组件可能自定义名称，短名不能作为依赖名）
+    pub type_dependencies: &'static [TypeId],
+    /// primary 依赖：直接存储 `TypeId::of::<ConcreteType>()`，由 `#[inject_primary]` 生成
+    /// DFS 展开时仅建边到该类型的 primary 实例，不强制创建同类型其他实例
+    pub primary_dependencies: &'static [TypeId],
     pub name: &'static str,
-    pub type_id: TypeId,
+    /// 条件声明：None 表示无条件注册；Some 为惰性构造函数指针，
+    /// 注册期调用一次求值，不满足则组件不注册（不参与 DFS 创建）
+    pub condition: Option<fn() -> ComponentCondition>,
     pub constructor: fn() -> Box<dyn ComponentProcessor>,
 }
 
@@ -62,11 +114,26 @@ pub struct TraitImplRegistration {
     pub accessor: TraitObjAccessorFn,
 }
 
+/// 编译期 primary（首要）实例注册结构体（供 `inventory` 收集）
+///
+/// 由 `#[primary]` 在 provider 函数上生成，声明"该具体类型的首要实例"：
+/// 当框架按类型获取组件时优先返回它。启动注册期被 `component_loader`
+/// 读入构建 primary 索引，并校验名字对应的组件存在、同类型 primary 唯一。
+pub struct PrimaryRegistration {
+    /// `TypeId::of::<ConcreteType>()`（const fn，static 初始化中直接求值）
+    pub type_id: TypeId,
+    /// primary 实例的组件名（必须与 `#[provider]` 注册的组件名一致）
+    pub name: &'static str,
+}
+
 // 自动收集所有标记了 ComponentProcessorFactory 的静态变量
 inventory::collect!(ComponentProcessorFactory);
 
 // 自动收集所有标记了 TraitImplRegistration 的静态变量
 inventory::collect!(TraitImplRegistration);
+
+// 自动收集所有标记了 PrimaryRegistration 的静态变量
+inventory::collect!(PrimaryRegistration);
 
 /// 组件包装器
 ///
@@ -107,7 +174,8 @@ impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
 
     async fn init(&mut self) -> anyhow::Result<()> {
         if let Some(init_fn) = self.init_fn.take() {
-            // 将 Arc 克隆一份传给初始化函数
+            // init 传入 Arc 克隆（共享引用，对应用户方法 &self 签名），
+            // 实例所有权仍保留在仓库中；destroy 阶段才真正移交所有权
             if let Some(arc_t) = self.inner.as_ref() {
                 init_fn(arc_t.clone()).await?;
             }
@@ -118,8 +186,10 @@ impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
     async fn destroy(&mut self) -> anyhow::Result<()> {
         if let Some(destroy_fn) = self.destroy_fn.take() {
             if let Some(arc_t) = self.inner.take() {
-                // 尝试解包 Arc 获取唯一所有权
-                // 只有当引用计数为 1 时（即没有其他地方持有该组件），才能成功解包并安全销毁
+                // 与 init 传入 Arc 共享引用不同：destroy 尝试解包 Arc 拿到
+                // 「有所有权」的实例 T（对应用户方法 self 签名），供销毁逻辑
+                // 消费字段、取出内部资源。只有当引用计数为 1 时（即没有
+                // 其他地方持有该组件），才能成功解包并安全销毁
                 match Arc::try_unwrap(arc_t) {
                     Ok(t) => {
                         // 成功拿到 T 的所有权，执行销毁逻辑
@@ -143,5 +213,9 @@ impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
 
     fn get_inner_arc_any(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         self.inner.as_ref().map(|arc| arc.clone() as Arc<dyn Any + Send + Sync>)
+    }
+
+    fn type_id(&self) -> TypeId {
+        TypeId::of::<T>()
     }
 }
