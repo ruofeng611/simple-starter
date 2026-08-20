@@ -92,11 +92,11 @@ pub struct ComponentProcessorFactory {
     /// 无名称注入 `Arc<T>` 时使用（组件可能自定义名称，短名不能作为依赖名）
     pub type_dependencies: &'static [TypeId],
     /// primary 依赖：直接存储 `TypeId::of::<ConcreteType>()`，由 `#[inject_primary]` 生成
-    /// DFS 展开时仅建边到该类型的 primary 实例，不强制创建同类型其他实例
+    /// 建图时仅建边到该类型的 primary 实例，不强制创建同类型其他实例
     pub primary_dependencies: &'static [TypeId],
     pub name: &'static str,
     /// 条件声明：None 表示无条件注册；Some 为惰性构造函数指针，
-    /// 注册期调用一次求值，不满足则组件不注册（不参与 DFS 创建）
+    /// 注册期调用一次求值，不满足则组件不注册（不参与后续创建）
     pub condition: Option<fn() -> ComponentCondition>,
     pub constructor: fn() -> Box<dyn ComponentProcessor>,
 }

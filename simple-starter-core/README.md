@@ -10,7 +10,7 @@
 
 1. **注册**：`#[component]` / `#[provider]` / `#[configuration]` 宏在编译期生成静态注册元数据（`ComponentProcessorFactory`），通过 `inventory` 自动收集（Rust 无反射，编译期静态收集替代运行时扫描）。
 2. **条件过滤**：注册期统一评估 `condition` 表达式，不满足者不参与装配。
-3. **依赖排序**：基于组件声明的四类依赖（名称 / trait / 类型 / primary）构建有向图，DFS 三色标记防环，得到创建顺序。
+3. **依赖排序**：基于组件声明的四类依赖（名称 / trait / 类型 / primary）构建有向图，Kahn 拓扑排序得到创建顺序；存在依赖环时排序结果数小于组件总数，报错并给出环路径。
 4. **创建**：按依赖序调用构造函数，非注入字段使用 `Default::default()` 填充。
 5. **初始化**：全部组件创建完成后，按创建序执行 `init_method`（init 阶段可安全获取依赖组件）。方法签名 `async fn init(&self)`：以 `Arc<T>` 共享引用调用，实例所有权仍在仓库，仅能读取/借用自身。
 6. **销毁**：退出时按创建序的逆序执行 `destroy_method`。方法签名 `async fn destroy(self)`：与 init 不同，以「有所有权」的实例 `T` 调用，所有权已从仓库移出，可消费字段、取出内部资源（要求此时无其他地方持有该实例，即 `Arc` 计数为 1）。
@@ -340,33 +340,33 @@ impl CacheService for RedisCacheService {
 
 ```mermaid
 graph TD
-    Start([Application::run]) --> ConfigLoad
+    Start(["Application::run"]) --> ConfigLoad
 
-    subgraph S_Config [1. 配置与日志加载]
+    subgraph S_Config ["1. 配置与日志加载"]
         ConfigLoad[加载全局配置] --> LoadBase["加载 application.toml"]
         LoadBase --> CheckProfile{是否存在 Profile?}
         CheckProfile -- 是 --> LoadProfile["加载 application-{profile}.toml"]
-        LoadProfile --> MergeConfig[合并配置: 默认 + 基础 + Profile]
+        LoadProfile --> MergeConfig["合并配置: 默认 + 基础 + Profile"]
         CheckProfile -- 否 --> MergeConfig
         MergeConfig --> InitTracing[初始化 Tracing 日志系统]
         InitTracing --> SetupLayers[设置日志层 & 文件守卫]
     end
 
-    subgraph S_Runtime [2. 运行时初始化]
+    subgraph S_Runtime ["2. 运行时初始化"]
         SetupLayers --> InitRuntime[初始化 Tokio 运行时]
         InitRuntime --> CheckFactory{是否有自定义工厂?}
         CheckFactory -- 是 --> UseFactory[使用自定义运行时工厂]
         CheckFactory -- 否 --> BuildRuntime[构建 多线程/单线程 运行时]
     end
 
-    subgraph S_Start [3. 启动阶段]
+    subgraph S_Start ["3. 启动阶段"]
         UseFactory --> CallStart["调用 self.start()"]
         BuildRuntime --> CallStart
         CallStart --> PluginSort[按依赖排序插件]
         PluginSort --> PluginAssemble["循环: plugin.assemble() 装配期"]
         PluginAssemble --> CheckComps{是否存在组件?}
 
-        subgraph S_Components [组件加载流程]
+        subgraph S_Components ["组件加载流程"]
             CheckComps -- 是 --> CompLoad[加载组件仓库]
             CompLoad --> CompReg[注册并检查名称唯一性]
             CompReg --> CompCond[条件评估与过滤]
@@ -383,14 +383,14 @@ graph TD
         PluginFinalize --> StartHooks[执行启动钩子 Startup Hooks]
     end
 
-    subgraph S_Execution [4. 主运行循环]
+    subgraph S_Execution ["4. 主运行循环"]
         StartHooks --> CheckMainLoop{是否有自定义主循环?}
-        CheckMainLoop -- 是 (如 GUI) --> SpawnCore[后台派发 App 核心管理任务]
+        CheckMainLoop -- "是 (如 GUI)" --> SpawnCore["后台派发 App 核心管理任务"]
         SpawnCore --> UserLoop[执行用户自定义主循环钩子]
         UserLoop --> UserShutdown["用户手动调用 shutdown()"]
-        CheckMainLoop -- 否 (默认) --> BlockCore[阻塞等待 App 核心任务]
+        CheckMainLoop -- "否 (默认)" --> BlockCore["阻塞等待 App 核心任务"]
 
-        subgraph S_CoreTask [核心任务逻辑]
+        subgraph S_CoreTask ["核心任务逻辑"]
             BlockCore --> SchedCreate[创建并启动 Cron 调度器]
             SchedCreate --> TaskSpawn[派发注册的异步任务]
             TaskSpawn --> WaitSignal[等待退出信号 Ctrl+C / SIGTERM]
@@ -399,7 +399,7 @@ graph TD
         WaitSignal --> AutoShutdown[触发自动关闭流程]
     end
 
-    subgraph S_Shutdown [5. 关闭流程]
+    subgraph S_Shutdown ["5. 关闭流程"]
         UserShutdown --> ShutdownStart["执行 shutdown()"]
         AutoShutdown --> ShutdownStart
         ShutdownStart --> CancelToken[取消异步任务 Token]

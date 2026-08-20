@@ -8,11 +8,11 @@ use crate::global_state::{
     TYPE_INSTANCE_NAMES,
 };
 use crate::utils::app_inner_util::{
-    build_component_indexes, build_impl_registration_index, build_trait_impl_index,
+    build_component_indexes, build_impl_registration_index, build_trait_impl_index, find_cycle_path,
 };
 use anyhow::{Context, anyhow};
 use std::any::TypeId;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
 /// 全局组件启动顺序队列
@@ -24,8 +24,8 @@ pub(crate) static COMPONENT_ORDER: Mutex<Vec<ComponentKey>> = Mutex::new(Vec::ne
 /// 加载并初始化所有组件
 ///
 /// 包含三个步骤：
-/// 1. 注册阶段：扫描 inventory 工厂、校验名称唯一、条件过滤，构建 DFS 索引。
-/// 2. 创建阶段：DFS 深度优先创建组件，按需展开四类依赖（名称/trait/类型/primary）。
+/// 1. 注册阶段：扫描 inventory 工厂、校验名称唯一、条件过滤，构建创建阶段索引。
+/// 2. 创建阶段：建图展开四类依赖（名称/trait/类型/primary）→ Kahn 拓扑排序 → 按序创建。
 /// 3. 初始化阶段：按创建顺序统一执行 init。
 pub(crate) async fn component_repository_load() -> anyhow::Result<()> {
     let plan = register_components()?;
@@ -44,7 +44,7 @@ struct LoadPlan {
     entries: HashMap<String, PlanEntry>,
     /// trait 实现索引：trait_type_id → 所有实现的具体类型（trait 依赖展开用）
     trait_impl_index: HashMap<TypeId, Vec<TypeId>>,
-    /// 具体类型 → 实例名列表 索引（trait 依赖展开使用，避免 DFS 期间扫描仓库）
+    /// 具体类型 → 实例名列表 索引（trait 依赖展开使用，避免建图期间扫描仓库）
     type_instance_index: HashMap<TypeId, Vec<String>>,
     /// 实现类型 → 匹配的 trait 实现注册列表（一对多，populate 填充缓存用）
     impl_registration_index: HashMap<TypeId, Vec<&'static TraitImplRegistration>>,
@@ -54,13 +54,13 @@ struct LoadPlan {
 struct PlanEntry {
     /// 具体类型依赖（组件名列表）
     dependencies: Vec<&'static str>,
-    /// trait 依赖的 TypeId 列表（DFS 时展开为全部实现组件）
+    /// trait 依赖的 TypeId 列表（建图时展开为全部实现组件）
     trait_dependencies: Vec<TypeId>,
-    /// 具体类型依赖的 TypeId 列表（DFS 时展开为该类型全部实例；
+    /// 具体类型依赖的 TypeId 列表（建图时展开为该类型全部实例；
     /// 无名称注入 `Arc<T>` 时使用，组件可能自定义名称）
     type_dependencies: Vec<TypeId>,
     /// primary 依赖的 TypeId 列表（`#[inject_primary]` 生成；
-    /// DFS 时仅建边到该类型的 primary 实例，不强制创建同类型其他实例）
+    /// 建图时仅建边到该类型的 primary 实例，不强制创建同类型其他实例）
     primary_dependencies: Vec<TypeId>,
     /// 条件声明：None 无条件注册；Some 为注册期已求值的条件
     condition: Option<ComponentCondition>,
@@ -69,7 +69,7 @@ struct PlanEntry {
 /// 注册组件阶段
 ///
 /// 遍历 inventory 收集的工厂，校验名称唯一性，存入仓库，
-/// 构建 DFS 创建所需的索引并返回加载计划。
+/// 构建创建阶段所需的索引并返回加载计划。
 fn register_components() -> anyhow::Result<LoadPlan> {
     let mut entries: HashMap<String, PlanEntry> = HashMap::new();
     let mut registered_names: HashSet<String> = HashSet::new();
@@ -108,13 +108,13 @@ fn register_components() -> anyhow::Result<LoadPlan> {
         );
     }
 
-    // 5. 注册期条件过滤（不满足的组件从仓库与计划中移除，不参与 DFS 创建）
+    // 5. 注册期条件过滤（不满足的组件从仓库与计划中移除，不参与创建）
     filter_components_by_condition(&mut entries)?;
 
     // 6. 构建 primary 索引（条件过滤后，校验 primary 名字对应组件存在、同类型唯一）
     build_primary_index()?;
 
-    // 7. 构建 DFS 所需索引（启动期局部数据，加载完成后即释放）
+    // 7. 构建创建阶段所需索引（启动期局部数据，加载完成后即释放）
     let trait_impl_index = build_trait_impl_index();
     let impl_registration_index = build_impl_registration_index();
     // 组件名快照已由 entries 的 key 集表达（条件过滤同步移除仓库与计划，两者等价）
@@ -131,7 +131,7 @@ fn register_components() -> anyhow::Result<LoadPlan> {
 /// 注册期条件过滤
 ///
 /// 两阶段语义：inventory 工厂全量登记后统一评估，不满足者从仓库与创建
-/// 计划中移除，使其不参与后续 DFS 创建。条件仅依赖"注册信息 + 全局配置"，
+/// 计划中移除，使其不参与后续创建。条件仅依赖"注册信息 + 全局配置"，
 /// 评估结果与组件创建顺序无关（对齐 Spring 的 bean definition 期条件评估语义）。
 ///
 /// 单轮评估 + 全量注册快照：评估开始时的快照在整个评估过程中保持不变，
@@ -158,7 +158,7 @@ fn filter_components_by_condition(entries: &mut HashMap<String, PlanEntry>) -> a
         }
     }
 
-    // 3. 统一移除：仓库 + 创建计划（DFS 索引在过滤后构建，天然不含被移除组件）
+    // 3. 统一移除：仓库 + 创建计划（创建阶段索引在过滤后构建，天然不含被移除组件）
     for name in &to_remove {
         COMPONENT_REPOSITORY.remove(name);
         entries.remove(name);
@@ -205,98 +205,75 @@ fn build_primary_index() -> anyhow::Result<()> {
 }
 
 // =============================================================================
-// 创建阶段（DFS 深度优先）
+// 创建阶段（建图 → 拓扑排序 → 按序创建）
 // =============================================================================
 
-/// DFS 创建阶段的运行时上下文（仅启动期局部使用，加载完成即释放）
-struct DfsCreation {
-    plan: LoadPlan,
-    /// 组件名 → 三色创建状态
-    states: HashMap<String, CreateState>,
+/// 创建阶段依赖图（启动期局部数据，加载完成即释放）
+///
+/// 边方向：依赖项 → 依赖它的组件。Kahn 排序时依赖项先出队，
+/// 出队后将其所有依赖者的入度减一，减到 0 的依赖者入队，
+/// 天然保证"依赖先于依赖者"的创建顺序。
+struct CreationGraph {
+    /// 依赖项组件名 → 依赖它的组件列表（Kahn 出队后传播减度）
+    dependents: HashMap<String, Vec<String>>,
+    /// 组件名 → 未满足的依赖数量（Kahn 入度，减到 0 即可创建）
+    in_degree: HashMap<String, usize>,
 }
 
-/// 三色创建状态（DFS 环检测与去重）
+/// 阶段一：建图 + 拓扑排序 + 按序创建组件
 ///
-/// "白色"（已注册未创建）状态由 `states` 表中键不存在隐式表示，无需显式变体。
-enum CreateState {
-    /// 灰：正在 DFS 栈中（再次访问 = 循环依赖）
-    Creating,
-    /// 黑：已创建完成（再次访问 = 缓存命中，直接跳过）
-    Created,
-}
-
-/// 阶段一：DFS 深度优先创建组件
-///
-/// 创建顺序由"依赖先于依赖者"的 DFS 序决定，与拓扑排序等价；
-/// 每个组件创建完成后立即填充 trait object 缓存并记录创建顺序。
+/// 环在创建任何组件之前一次性检出（排序结果数小于组件总数即有环），
+/// 创建失败不会残留部分已创建的组件状态。
 async fn run_creation(plan: LoadPlan) -> anyhow::Result<()> {
-    let mut dfs = DfsCreation {
-        plan,
-        states: HashMap::new(),
-    };
+    // 1. 建图：展开四类依赖为边（依赖项 → 依赖者）
+    let graph = build_creation_graph(&plan)?;
 
-    // 1. 根序列：创建计划全量组件名（entries 的 key 集即过滤后仓库全量组件）
-    let roots: Vec<String> = dfs.plan.entries.keys().cloned().collect();
+    // 2. Kahn 拓扑排序：得到"依赖先于依赖者"的创建顺序
+    let order = topo_sort_creation(&graph)?;
 
-    // 2. 对每个根执行 DFS 创建
-    let mut stack = Vec::new();
-    for name in &roots {
-        dfs.dfs_create(name, &mut stack).await?;
+    // 3. 按序迭代创建
+    for name in &order {
+        create_one(name, &plan).await?;
     }
 
     Ok(())
 }
 
-impl DfsCreation {
-    /// 按组件名深度优先创建（组件名全局唯一，仓库 key 即组件名）
-    async fn dfs_create(&mut self, name: &str, stack: &mut Vec<String>) -> anyhow::Result<()> {
-        // 1. 三色状态判断
-        match self.states.get(name) {
-            Some(CreateState::Created) => return Ok(()), // 黑：已创建，菱形依赖安全
-            Some(CreateState::Creating) => {
-                // 灰：再次访问 = 循环依赖，栈即为依赖链
+/// 建图：把每个组件的四类依赖声明展开为具体组件名，构建依赖边
+///
+/// 依赖声明来自注册期快照，创建期无动态依赖：
+/// - 名称依赖：直接建边（依赖未注册 fail-fast）
+/// - trait 依赖：展开为全部实现组件的全部实例（无实现/无实例 fail-fast）
+/// - 类型依赖：展开为该类型的全部实例（无实例 fail-fast）
+/// - primary 依赖：仅建边到该类型的 primary 实例（无声明 fail-fast）
+///
+/// 四类依赖在建边时统一去重合并，否则入度与重复边都会失真。
+fn build_creation_graph(plan: &LoadPlan) -> anyhow::Result<CreationGraph> {
+    let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
+    let mut in_degree: HashMap<String, usize> = HashMap::new();
+
+    for name in plan.entries.keys() {
+        let entry = &plan.entries[name];
+        // 去重后的直接依赖集合（四类依赖可能指向同一组件，合并为唯一边）
+        let mut deps: HashSet<String> = HashSet::new();
+
+        // 1. 名称依赖：依赖未注册时在此 fail-fast
+        for dep_name in &entry.dependencies {
+            if !plan.entries.contains_key(*dep_name) {
                 return Err(anyhow!(
-                    "Circular dependency detected in components: [{} -> {}]",
-                    stack.join(" -> "),
-                    name
+                    "Component depends on '{}', but '{}' is not registered.",
+                    dep_name,
+                    dep_name
                 ));
             }
-            _ => {}
+            deps.insert(dep_name.to_string());
         }
 
-        // 2. 置灰并压栈
-        self.states
-            .insert(name.to_string(), CreateState::Creating);
-        stack.push(name.to_string());
-
-        // 3. 解析依赖清单（先 clone 出四类依赖，避免与递归调用的可变借用冲突）
-        let (dependencies, trait_dependencies, type_dependencies, primary_dependencies) = {
-            let entry = self
-                .plan
-                .entries
-                .get(name)
-                .ok_or_else(|| anyhow!("Component '{}' has no creation plan", name))?;
-            (
-                entry.dependencies.clone(),
-                entry.trait_dependencies.clone(),
-                entry.type_dependencies.clone(),
-                entry.primary_dependencies.clone(),
-            )
-        };
-
-        // 4. 名称依赖：按组件名递归创建（依赖未注册时在此 fail-fast）
-        for dep_name in &dependencies {
-            self.resolve_key(dep_name)?;
-            Box::pin(self.dfs_create(dep_name, stack)).await?;
-        }
-
-        // 5. trait 依赖：展开为全部实现组件的全部实例
-        for trait_type_id in &trait_dependencies {
-            let impls = self
-                .plan
+        // 2. trait 依赖：展开为全部实现组件的全部实例
+        for trait_type_id in &entry.trait_dependencies {
+            let impls = plan
                 .trait_impl_index
                 .get(trait_type_id)
-                .cloned()
                 .ok_or_else(|| {
                     anyhow!(
                         "Component '{}' depends on a trait (TypeId={:?}) that has no registered implementations",
@@ -307,11 +284,9 @@ impl DfsCreation {
 
             let mut resolved_any = false;
             for impl_type_id in impls.iter() {
-                let instance_names = self
-                    .plan
+                let instance_names = plan
                     .type_instance_index
                     .get(impl_type_id)
-                    .cloned()
                     .ok_or_else(|| {
                         anyhow!(
                             "Component '{}' depends on a trait (TypeId={:?}), but its implementation type {:?} is not registered",
@@ -320,8 +295,8 @@ impl DfsCreation {
                             impl_type_id
                         )
                     })?;
-                for impl_name in &instance_names {
-                    Box::pin(self.dfs_create(impl_name, stack)).await?;
+                for impl_name in instance_names {
+                    deps.insert(impl_name.clone());
                     resolved_any = true;
                 }
             }
@@ -335,13 +310,11 @@ impl DfsCreation {
             }
         }
 
-        // 6. 类型依赖：展开为该类型的所有实例
-        for type_id in &type_dependencies {
-            let instance_names = self
-                .plan
+        // 3. 类型依赖：展开为该类型的所有实例
+        for type_id in &entry.type_dependencies {
+            let instance_names = plan
                 .type_instance_index
                 .get(type_id)
-                .cloned()
                 .ok_or_else(|| {
                     anyhow!(
                         "Component '{}' depends on type (TypeId={:?}) that has no registered component instances",
@@ -349,14 +322,14 @@ impl DfsCreation {
                         type_id
                     )
                 })?;
-            for impl_name in &instance_names {
-                Box::pin(self.dfs_create(impl_name, stack)).await?;
+            for impl_name in instance_names {
+                deps.insert(impl_name.clone());
             }
         }
 
-        // 7. primary 依赖：仅建边到该类型的 primary 实例，
-        //    不强制创建同类型其他实例（留给用户按需获取）
-        for type_id in &primary_dependencies {
+        // 4. primary 依赖：仅建边到该类型的 primary 实例
+        for type_id in &entry.primary_dependencies {
+            // 注册期 build_primary_index 已校验 primary 名对应的组件存在
             let primary_name = PRIMARY_BY_TYPE.get(type_id).ok_or_else(|| {
                 anyhow!(
                     "Component '{}' depends on a primary instance (TypeId={:?}) that is not registered; a #[primary] must be declared on one of the type's providers",
@@ -364,56 +337,99 @@ impl DfsCreation {
                     type_id
                 )
             })?;
-            // 注册期 build_primary_index 已校验 primary 名对应的组件存在，此处直接递归创建
-            Box::pin(self.dfs_create(&primary_name.value().clone(), stack)).await?;
+            deps.insert(primary_name.value().clone());
         }
 
-        // 8. 创建自身：先从仓库移除再执行 create，避免写锁跨 await
-        //    与 create 回调读取仓库时同 shard 死锁
-        let key = self.resolve_key(name)?;
-        let (_, mut processor) = COMPONENT_REPOSITORY
-            .remove(&key)
-            .ok_or_else(|| anyhow!("Component '{}' not found in repository", name))?;
-
-        let create_result = processor
-            .create()
-            .await
-            .with_context(|| format!("Failed to create component: {}", name));
-        COMPONENT_REPOSITORY.insert(key.clone(), processor);
-        create_result?;
-
-        tracing::debug!("Component created: {}", name);
-
-        // 9. 创建后立即缓存该组件的 trait object，
-        //    确保后续组件在 create 阶段即可通过 get_component_by_trait 获取依赖
-        populate_trait_obj_cache(&key, &self.plan.impl_registration_index)?;
-
-        // 10. 记录创建顺序（销毁时逆序使用）
-        {
-            let mut guard = COMPONENT_ORDER
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Failed to lock COMPONENT_ORDER (Poisoned)"))?;
-            guard.push(key);
-        }
-
-        // 11. 置黑并出栈
-        self.states.insert(name.to_string(), CreateState::Created);
-        stack.pop();
-        Ok(())
-    }
-
-    /// 依赖名校验（依赖未注册时 fail-fast）；仓库 key 即组件名，校验通过后直接使用
-    fn resolve_key(&self, name: &str) -> anyhow::Result<String> {
-        if self.plan.entries.contains_key(name) {
-            Ok(name.to_string())
-        } else {
-            Err(anyhow!(
-                "Component depends on '{}', but '{}' is not registered.",
-                name,
-                name
-            ))
+        // 入度 = 去重后的直接依赖数；反向登记依赖者
+        in_degree.insert(name.clone(), deps.len());
+        for dep in deps {
+            dependents.entry(dep).or_default().push(name.clone());
         }
     }
+
+    Ok(CreationGraph {
+        dependents,
+        in_degree,
+    })
+}
+
+/// Kahn 拓扑排序：入度为 0 者先创建，出队后传播减度
+///
+/// 返回创建顺序（依赖先于依赖者）。存在环时排序结果数小于组件总数，
+/// 调用 `find_cycle_path` 生成可读的环路径后 fail-fast。
+fn topo_sort_creation(graph: &CreationGraph) -> anyhow::Result<Vec<String>> {
+    let total = graph.in_degree.len();
+    let mut in_degree = graph.in_degree.clone();
+    let mut order: Vec<String> = Vec::with_capacity(total);
+
+    // 双端队列（头出尾进）：初始入队所有无依赖组件
+    let mut queue: VecDeque<String> = VecDeque::new();
+    for (name, degree) in in_degree.iter() {
+        if *degree == 0 {
+            queue.push_back(name.clone());
+        }
+    }
+
+    while let Some(name) = queue.pop_front() {
+        order.push(name.clone());
+        // 该组件即将创建，其依赖者的依赖数减一，减到 0 即可创建
+        if let Some(dependents) = graph.dependents.get(&name) {
+            for dependent in dependents {
+                let degree = in_degree
+                    .get_mut(dependent)
+                    .ok_or_else(|| anyhow!("Component '{}' has no in-degree entry", dependent))?;
+                *degree -= 1;
+                if *degree == 0 {
+                    queue.push_back(dependent.clone());
+                }
+            }
+        }
+    }
+
+    // 有环：剩余入度 > 0 的节点即环成员或依赖环的节点，生成可读路径后报错
+    if order.len() < total {
+        return Err(anyhow!(
+            "Circular dependency detected in components: [{}]",
+            find_cycle_path(&graph.dependents, &in_degree)
+        ));
+    }
+
+    Ok(order)
+}
+
+/// 创建单个组件
+///
+/// 采用 temporarily remove 模式执行 create：避免写锁跨 await
+/// 与 create 回调读取仓库时同 shard 死锁。
+/// 创建完成后立即填充 trait object 缓存（依赖者 create 阶段即可
+/// 按 trait 获取），并记录创建顺序（销毁时逆序使用）。
+async fn create_one(name: &str, plan: &LoadPlan) -> anyhow::Result<()> {
+    let (_, mut processor) = COMPONENT_REPOSITORY
+        .remove(name)
+        .ok_or_else(|| anyhow!("Component '{}' not found in repository", name))?;
+
+    let create_result = processor
+        .create()
+        .await
+        .with_context(|| format!("Failed to create component: {}", name));
+    COMPONENT_REPOSITORY.insert(name.to_string(), processor);
+    create_result?;
+
+    tracing::debug!("Component created: {}", name);
+
+    // 创建后立即缓存该组件的 trait object，
+    // 确保后续组件在 create 阶段即可通过 get_component_by_trait 获取依赖
+    populate_trait_obj_cache(&name.to_string(), &plan.impl_registration_index)?;
+
+    // 记录创建顺序（销毁时逆序使用）
+    {
+        let mut guard = COMPONENT_ORDER
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Failed to lock COMPONENT_ORDER (Poisoned)"))?;
+        guard.push(name.to_string());
+    }
+
+    Ok(())
 }
 
 // =============================================================================

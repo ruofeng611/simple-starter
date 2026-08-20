@@ -4,7 +4,7 @@
 //! definition 期 `@Conditional` 语义），评估结果与组件创建顺序无关。
 //!
 //! 流程：inventory 工厂全量登记（含惰性条件构造函数）→ `filter_components_by_condition`
-//! 求值条件并构建注册全量快照单轮评估 → 不满足者从仓库统一移除 → 构建 DFS 索引。
+//! 求值条件并构建注册全量快照单轮评估 → 不满足者从仓库统一移除 → 构建创建阶段索引。
 
 use crate::utils::app_core_util::AppCoreUtil;
 use crate::utils::app_inner_util::{build_component_indexes, build_trait_impl_index};
@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 /// 组件条件声明
 ///
 /// 由 `#[component(condition = ...)]` 宏参数生成，经工厂的惰性构造函数
-/// 在注册期求值一次，随后在 DFS 创建前统一评估。
+/// 在注册期求值一次，随后在组件创建前统一评估。
 #[derive(Clone, Copy)]
 pub enum ComponentCondition {
     /// 无其他已注册组件是此具体类型（"默认实现 + 用户覆盖"场景）
@@ -103,11 +103,11 @@ pub struct ConditionContext {
 impl ConditionContext {
     /// 构建注册全量快照（仓库 + inventory trait 注册）
     ///
-    /// 仅在组件加载的注册期调用（DFS 前，单线程启动阶段），无锁竞争风险。
+    /// 仅在组件加载的注册期调用（组件创建前，单线程启动阶段），无锁竞争风险。
     pub(crate) fn snapshot() -> Self {
-        // 仓库全量快照（与 DFS 索引共用同一构建工具；此处为过滤前全量语义）
+        // 仓库全量快照（与创建阶段索引共用同一构建工具；此处为过滤前全量语义）
         let (registered_names, type_instance_index) = build_component_indexes();
-        // trait → 已注册实现类型列表（与 DFS trait 展开共用同一索引构建工具）
+        // trait → 已注册实现类型列表（与建图 trait 展开共用同一索引构建工具）
         let registered_trait_impls = build_trait_impl_index();
 
         Self {

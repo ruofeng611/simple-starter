@@ -42,7 +42,7 @@ pub(crate) static TYPE_INSTANCE_NAMES: LazyLock<
 ///
 /// 在 `populate_trait_obj_cache`（每个组件 create 后）同步填充，
 /// 供 `get_component_by_trait` / `get_components_by_trait` 使用。
-/// DFS 保证依赖组件先于依赖者创建，依赖者 create 阶段访问时索引必已填充。
+/// 拓扑排序保证依赖组件先于依赖者创建，依赖者 create 阶段访问时索引必已填充。
 pub(crate) static TRAIT_INSTANCE_NAMES: LazyLock<
     DashMap<TypeId, Vec<String>>
 > = LazyLock::new(DashMap::new);
