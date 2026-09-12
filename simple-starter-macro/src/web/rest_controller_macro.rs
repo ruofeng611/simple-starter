@@ -165,11 +165,11 @@ pub(crate) fn rest_controller_macro(args: TokenStream, input: TokenStream) -> To
 
                     ::simple_starter_core::submit!(
                         ::simple_starter_web::RouteFactory {
-                            router: || {
+                            router: |container: &::simple_starter_core::ComponentContainer| {
                                 ::simple_starter_web::axum::Router::new()
                                     .route(#full_path, #router_method(#handler_fn_name))
                                     .with_state(
-                                        simple_starter_core::AppCoreUtil::get_component::<#controller_type>()
+                                        container.get_component::<#controller_type>()
                                             .expect(concat!("Failed to get ", stringify!(#controller_type), " component"))
                                     )
                             },

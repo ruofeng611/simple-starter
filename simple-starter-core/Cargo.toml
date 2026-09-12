@@ -1,6 +1,6 @@
 [package]
 name = "simple-starter-core"
-version = "3.0.1"
+version = "4.0.0"
 edition = "2024"
 
 [dependencies]
@@ -15,7 +15,6 @@ inventory = { workspace = true }
 tokio = { workspace = true }
 tokio-cron-scheduler = { workspace = true }
 thiserror = { workspace = true }
-dashmap = { workspace = true}
 async-trait = { workspace = true }
 tokio-util = { workspace = true}
 tracing-appender = { workspace = true }

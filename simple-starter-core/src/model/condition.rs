@@ -3,13 +3,15 @@
 //! 提供组件"条件注册"支持：条件在**注册期**统一评估（对齐 Spring bean
 //! definition 期 `@Conditional` 语义），评估结果与组件创建顺序无关。
 //!
-//! 流程：inventory 工厂全量登记（含惰性条件构造函数）→ `filter_components_by_condition`
-//! 求值条件并构建注册全量快照单轮评估 → 不满足者从仓库统一移除 → 构建创建阶段索引。
+//! 流程：inventory 工厂全量登记（含惰性条件构造函数）→ 组件加载器的
+//! 条件过滤步骤求值条件并构建注册全量快照单轮评估 → 不满足者从仓库统一移除。
 
-use crate::utils::app_core_util::AppCoreUtil;
-use crate::utils::app_inner_util::{build_component_indexes, build_trait_impl_index};
+use crate::model::component::ComponentContainer;
+use crate::utils::core_util::get_config_value_by_path;
+use crate::utils::inner_util::{build_component_indexes, build_trait_impl_index};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet};
+use toml::Value;
 
 /// 组件条件声明
 ///
@@ -58,7 +60,8 @@ impl ComponentCondition {
     ///
     /// `candidate` 为当前被评估的组件名，用于排除"组件自己"——
     /// 例如默认实现的条件是"无其他实现"，不应把自己计入已注册集合。
-    pub(crate) fn evaluate(&self, ctx: &ConditionContext, candidate: &str) -> bool {
+    /// `config` 为合并后的全局配置（注册期条件评估时已写入容器）。
+    pub(crate) fn evaluate(&self, ctx: &ConditionContext, candidate: &str, config: &Value) -> bool {
         match self {
             Self::OnMissingType(get_type_id) => {
                 let target = get_type_id();
@@ -74,7 +77,7 @@ impl ComponentCondition {
                     .any(|impl_type| ctx.has_other_instance_of_type(impl_type, candidate))
             }
             Self::OnProperty { key, expected } => {
-                let Some(value) = AppCoreUtil::get_config_value_by_path(key) else {
+                let Some(value) = get_config_value_by_path(config, key) else {
                     return false;
                 };
                 match expected {
@@ -101,12 +104,17 @@ pub struct ConditionContext {
 }
 
 impl ConditionContext {
-    /// 构建注册全量快照（仓库 + inventory trait 注册）
+    /// 构建注册全量快照（容器仓库 + inventory trait 注册）
     ///
     /// 仅在组件加载的注册期调用（组件创建前，单线程启动阶段），无锁竞争风险。
-    pub(crate) fn snapshot() -> Self {
+    pub(crate) fn snapshot(container: &ComponentContainer) -> Self {
         // 仓库全量快照（与创建阶段索引共用同一构建工具；此处为过滤前全量语义）
-        let (registered_names, type_instance_index) = build_component_indexes();
+        let (registered_names, type_instance_index) = build_component_indexes(
+            container
+                .repository
+                .get()
+                .expect("repository must be initialized during registration"),
+        );
         // trait → 已注册实现类型列表（与建图 trait 展开共用同一索引构建工具）
         let registered_trait_impls = build_trait_impl_index();
 

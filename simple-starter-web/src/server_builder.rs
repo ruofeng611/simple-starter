@@ -17,8 +17,9 @@ use crate::web_extension::WebExtensionRegistry;
 use axum::Router;
 use simple_starter_core::anyhow::Context;
 use simple_starter_core::tracing::{Level, info};
-use simple_starter_core::{anyhow, AppCoreUtil};
+use simple_starter_core::{ComponentContainer, anyhow};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
 
@@ -26,18 +27,24 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, Tr
 ///
 /// 该函数在应用核心后台任务中被调用，此时所有插件的 `assemble`、`components_ready` 与 `finalize` 已完成，
 /// 扩展注册表已被完全填充。
+///
+/// # 参数
+/// - `container`: 组件容器（Arc 克隆，路由工厂构建 rest controller 路由时经它获取组件）
+/// - `log_level`: HTTP 日志等级（finalize 期从配置快照）
 pub(crate) async fn build_and_serve(
     web_config: WebConfig,
     manual_routers: Vec<Box<dyn FnOnce() -> Router + Send>>,
     mut registry: WebExtensionRegistry,
     cancel_token: CancellationToken,
+    container: Arc<ComponentContainer>,
+    log_level: Level,
 ) -> anyhow::Result<()> {
     // === 阶段 1: 构建基础路由 ===
     let mut router = Router::new();
 
     // 合并 inventory 自动收集的路由
     for route_factory in inventory::iter::<RouteFactory> {
-        router = router.merge((route_factory.router)());
+        router = router.merge((route_factory.router)(&container));
     }
 
     // 合并手动注册的路由
@@ -64,13 +71,7 @@ pub(crate) async fn build_and_serve(
     }
 
     // === 阶段 5: 应用框架日志追踪中间件 ===
-    let log_level: Level = AppCoreUtil::get_config_value_by_path("logger.level")
-        .context("Failed to load 'logger.level' config")?
-        .as_str()
-        .context("Failed to parse log level as string")?
-        .parse()
-        .context("Invalid log level format")?;
-
+    // 日志等级由 WebPlugin 在 finalize 期从配置快照后传入（后台任务无容器句柄）
     router = router.layer(
         TraceLayer::new_for_http()
             .make_span_with(

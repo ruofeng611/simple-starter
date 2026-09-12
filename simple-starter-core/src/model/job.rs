@@ -1,5 +1,9 @@
-use crate::core::app_types::BoxFuture;
-use inventory;
+//! # 定时任务（cron 调度）
+//!
+//! 经 `#[cron_job]` 宏生成 `CronJob` 静态注册并经 `inventory` 收集，
+//! 启动时由 `Application` 读入构建调度器。
+
+use crate::BoxFuture;
 
 /// 定时任务结构体
 ///

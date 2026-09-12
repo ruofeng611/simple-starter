@@ -111,11 +111,13 @@ pub(crate) fn route_macro(method: &str, args: TokenStream, input: TokenStream) -
     // 5. 最终代码展开
     // - 保留原始函数定义 (#input_fn)
     // - 使用 submit! 宏注册 RouteFactory
+    // - 路由构建函数接收组件容器（RouteFactory::router 的签名），
+    //   无状态路由忽略该参数
     let expanded = quote! {
         #input_fn
         ::simple_starter_core::submit!(
             ::simple_starter_web::RouteFactory {
-                router: || { #router_build },
+                router: |_: &::simple_starter_core::ComponentContainer| { #router_build },
             }
         );
     };

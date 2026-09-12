@@ -24,13 +24,13 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
     let final_component_name = custom_name.unwrap_or_else(|| struct_name.to_string());
 
     // 3. 生成构造闭包 (Constructor)
-    // 逻辑：调用 AppCoreUtil::get_config_to_struct 读取配置
+    // 逻辑：从 create 回调传入的全局配置（Arc<Value>）读取并反序列化
     // 注意：这要求目标结构体必须实现了 serde::Deserialize
     let create_fn_impl = quote! {
-        Box::new(move || -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#struct_name>> {
+        Box::new(move |_container: std::sync::Arc<::simple_starter_core::ComponentContainer>, config: std::sync::Arc<::simple_starter_core::toml::Value>| -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#struct_name>> {
             Box::pin(async move {
                 // 尝试从配置路径加载
-                let config = ::simple_starter_core::AppCoreUtil::get_config_to_struct::<#struct_name>(#prefix)?;
+                let config = ::simple_starter_core::get_config_to_struct::<#struct_name>(&config, #prefix)?;
                 Ok(config)
             })
         })

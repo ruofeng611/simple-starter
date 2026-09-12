@@ -5,8 +5,19 @@
 use crate::SimpleAppWebError;
 use serde::Serialize;
 use serde_json::Value;
-use simple_starter_core::AppCoreUtil;
 use simple_starter_core::tracing::{error, warn};
+use std::sync::OnceLock;
+
+/// 服务名快照（启动期由 WebPlugin 从配置写入一次，请求期只读）
+///
+/// 请求处理期无法访问组件容器（后台任务无容器句柄），
+/// 故在插件 finalize 期将 `app.name` 配置快照到此。
+static SERVICE_NAME: OnceLock<Option<String>> = OnceLock::new();
+
+/// 写入服务名快照（WebPlugin finalize 期调用）
+pub(crate) fn set_service_name(name: Option<String>) {
+    let _ = SERVICE_NAME.set(name);
+}
 
 /// 标准化 Web API 响应结构
 ///
@@ -93,11 +104,8 @@ where
     T: Serialize,
     S: Into<String>,
 {
-    // 尝试获取服务名称配置
-    let service_name: Option<String> = match AppCoreUtil::get_config_value_by_path("app.name") {
-        Some(value) => value.as_str().map(|s| s.to_string()),
-        None => None,
-    };
+    // 读取服务名快照（启动期由 WebPlugin 写入）
+    let service_name: Option<String> = SERVICE_NAME.get().cloned().flatten();
 
     match result {
         // 业务逻辑执行成功

@@ -1,11 +1,14 @@
-use crate::core::app_component::{ComponentProcessor, TraitImplRegistration};
-use crate::global_state::{COMPONENT_REPOSITORY, TRAIT_INSTANCE_NAMES, TYPE_INSTANCE_NAMES};
+//! # 内部工具（框架私有辅助函数）
+//!
+//! 各装配流程共用的纯函数：配置合并、注册索引构建、类型短名、环检测。
+//! 均为 `pub(crate)`，不对外暴露。
+
+use crate::model::component::{ComponentProcessor, TraitImplRegistration};
 use std::any::TypeId;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Display;
 use std::hash::Hash;
 use toml::Value;
-
 
 /// 深度合并 TOML 值
 ///
@@ -59,46 +62,24 @@ pub(crate) fn build_impl_registration_index(
     index
 }
 
-/// 扫描当前仓库构建 组件名快照 + 具体类型索引
+/// 扫描容器仓库构建 组件名快照 + 具体类型索引
 ///
 /// 组件类型取自处理器本身（`ComponentProcessor::type_id`），而非仓库 key。
 /// 覆盖全部已注册组件。预计算快照，建图展开依赖时直接查询，
 /// 避免依赖展开路径上重复扫描仓库（快照语义与注册期一致）。
 /// 供组件加载（建图索引，过滤后调用）与条件注册（ConditionContext 快照，过滤前调用）共用。
-pub(crate) fn build_component_indexes() -> (HashSet<String>, HashMap<TypeId, Vec<String>>) {
+pub(crate) fn build_component_indexes(
+    repository: &HashMap<String, Box<dyn ComponentProcessor>>,
+) -> (HashSet<String>, HashMap<TypeId, Vec<String>>) {
     let mut names = HashSet::new();
     let mut type_index: HashMap<TypeId, Vec<String>> = HashMap::new();
-    for entry in COMPONENT_REPOSITORY.iter() {
-        let name = entry.key().clone();
+    for (name, processor) in repository.iter() {
         // 完全限定语法：ComponentProcessor: Any，需消除 Any::type_id 歧义；显式解引用 Box
-        let type_id = ComponentProcessor::type_id(&**entry.value());
+        let type_id = ComponentProcessor::type_id(&**processor);
         names.insert(name.clone());
-        type_index.entry(type_id).or_default().push(name);
+        type_index.entry(type_id).or_default().push(name.clone());
     }
     (names, type_index)
-}
-
-/// 获取具体类型下的所有组件实例名
-///
-/// 从 `TYPE_INSTANCE_NAMES` 索引读取（每个组件 create 后由
-/// `populate_trait_obj_cache` 填充）。
-/// 供 `get_component` 兜底查找（组件自定义名称时）使用。
-pub(crate) fn get_component_names_by_type(type_id: TypeId) -> Vec<String> {
-    TYPE_INSTANCE_NAMES
-        .get(&type_id)
-        .map(|entry| entry.value().clone())
-        .unwrap_or_default()
-}
-
-/// 获取 trait 下所有具体实现组件的实例名
-///
-/// 从 `TRAIT_INSTANCE_NAMES` 索引读取（`populate_trait_obj_cache` 时同步填充）。
-/// 拓扑排序保证依赖组件先于依赖者创建，依赖者 create 阶段访问时索引必已填充。
-pub(crate) fn get_impl_component_names_by_trait(trait_type_id: TypeId) -> Vec<String> {
-    TRAIT_INSTANCE_NAMES
-        .get(&trait_type_id)
-        .map(|entry| entry.value().clone())
-        .unwrap_or_default()
 }
 
 /// 获取类型的简短名称（去掉命名空间）

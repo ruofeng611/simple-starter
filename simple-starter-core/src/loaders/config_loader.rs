@@ -1,31 +1,27 @@
 //! # 配置加载器
 //!
 //! 负责从文件系统加载 `application.toml` 和 profile 配置，
-//! 并与默认配置合并后存入 `GLOBAL_CONFIG`。
+//! 并与默认配置合并后返回（由 `Application` 存入 `Arc<Value>` 持有）。
+//! 配置查询与反序列化函数位于 `utils::core_util`。
 
-use crate::global_state::GLOBAL_CONFIG;
-use crate::utils::app_inner_util::merge_toml_values;
-use anyhow::{Context, Result, anyhow};
+use crate::utils::inner_util::merge_toml_values;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 use toml::Value;
 
-/// 加载并设置全局配置
+/// 加载并合并全局配置
 ///
 /// 流程：
 /// 1. 加载用户配置（application.toml）。
 /// 2. 若指定了 profile，则加载 application-{profile}.toml 并合并。
-/// 3. 将用户配置合并到 Application 的默认配置之上。
-/// 4. 写入 GLOBAL_CONFIG。
-pub(crate) fn global_config_load(default_config: Value) -> Result<()> {
+/// 3. 将用户配置合并到 Application 的默认配置之上，返回最终配置。
+pub(crate) fn global_config_load(default_config: Value) -> Result<Value> {
     let user_config = load_user_config()?;
     // 注意：merge_toml_values(base, overlay)，这里 base 是默认配置，overlay 是用户文件配置
     let final_config = merge_toml_values(default_config, user_config);
 
-    GLOBAL_CONFIG
-        .set(final_config)
-        .map_err(|_| anyhow!("Failed to set global config"))?;
-    Ok(())
+    Ok(final_config)
 }
 
 /// 加载用户配置文件

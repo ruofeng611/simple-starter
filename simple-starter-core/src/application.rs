@@ -1,19 +1,15 @@
-use crate::core::app_config::{AppConfig, LoggerConfig, RuntimeConfig};
-use crate::core::app_job::CronJob;
-use crate::core::app_plugin::Plugin;
-use crate::core::app_types::TaskSpawnsFactory;
-use crate::extensions::Extensions;
-use crate::global_state::COMPONENT_REPOSITORY;
-use crate::loaders::component_loader::{component_repository_load, shutdown_components};
 use crate::loaders::config_loader::global_config_load;
-use crate::utils::app_inner_util::{find_cycle_path, merge_toml_values};
-use crate::{
-    AppCoreUtil, BoxFuture, ComponentProcessorFactory, LogExpectExt, LogLayersFactory,
-    TokioRuntimeFactory,
-};
+use crate::model::context::{AppContext, TaskSpawnsFactory};
+use crate::model::job::CronJob;
+use crate::model::plugin::Plugin;
+use crate::utils::core_util::{get_config_to_struct, LogExpectExt};
+use crate::utils::inner_util::{find_cycle_path, merge_toml_values};
+use crate::{BoxFuture, ComponentProcessorFactory};
 use anyhow::{Context, anyhow};
+use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
+use std::sync::Arc;
 use time::UtcOffset;
 use time::macros::format_description;
 use tokio::runtime::Builder;
@@ -29,64 +25,152 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry, fmt, registry};
 
+// ==================== Application 专属类型（构建期资源签名）====================
+
+/// Tokio 运行时工厂函数签名
+///
+/// 创建 Tokio 运行时实例。
+pub(crate) type TokioRuntimeFactory = Box<dyn FnOnce() -> anyhow::Result<tokio::runtime::Runtime> + Send>;
+
+/// 日志层工厂函数签名
+///
+/// 创建日志层实例。
+pub(crate) type LogLayersFactory = Box<dyn FnOnce() -> Box<dyn Layer<Registry> + Send + Sync> + Send>;
+
+/// 启动钩子函数签名
+///
+/// 在插件 finalize 之后、后台任务消费之前执行，接收应用上下文
+/// （`&mut AppContext`）：可在钩子内查询组件、读取配置、注册后台任务。
+/// 闭包内的 Future 要求 'static，需访问容器/配置时先 clone Arc。
+pub(crate) type StartupHook = Box<dyn FnOnce(&mut AppContext) -> BoxFuture<anyhow::Result<()>> + Send>;
+
+/// 关闭钩子函数签名
+///
+/// 在组件销毁之前执行，接收应用上下文（`&mut AppContext`）：可在钩子内
+/// 查询组件、读取配置做清理前处理。闭包内的 Future 要求 'static，
+/// 需访问容器/配置时先 clone Arc。
+pub(crate) type ShutdownHook = Box<dyn FnOnce(&mut AppContext) -> BoxFuture<anyhow::Result<()>> + Send>;
+
+// ==================== Application 配置映射结构 ====================
+
+/// 应用基础配置
+///
+/// 对应 TOML 中的 `[app]` 节
+#[derive(Deserialize, Debug)]
+pub(crate) struct AppConfig {
+    /// 激活的环境配置 (例如: "dev", "prod")，对应加载 application-{profile}.toml
+    profile: Option<String>,
+    /// 应用名称，用于日志显示等
+    name: Option<String>,
+}
+
+/// 日志配置
+///
+/// 对应 TOML 中的 `[logger]` 节
+#[derive(Deserialize, Debug)]
+pub(crate) struct LoggerConfig {
+    /// 日志级别 (TRACE, DEBUG, INFO, WARN, ERROR)
+    level: String,
+
+    /// 是否开启控制台输出
+    enable_console: bool,
+
+    /// 是否在日志中显示线程 ID
+    with_thread_id: bool,
+    /// 是否在日志中显示线程名称
+    with_thread_name: bool,
+    /// 日志时区，默认使用UTC时间
+    timezone: Option<String>,
+
+    /// 日志文件路径
+    log_dir: Option<String>,
+    /// 日志文件名
+    file_name: String,
+    /// 日志文件最大数量
+    max_file_number: usize,
+}
+
+/// 运行时配置
+///
+/// 对应 TOML 中的 `[runtime]` 节
+#[derive(Deserialize, Debug)]
+pub(crate) struct RuntimeConfig {
+    /// 工作线程数量。None=默认(CPU核数), 1=单线程运行时, >1=多线程运行时
+    worker_thread_num: Option<u8>,
+    /// 工作线程名称
+    worker_thread_name: String,
+}
+
 /// 应用程序构建器和运行时管理器
 ///
 /// 负责生命周期管理：配置 -> 日志 -> 运行时 -> 组件 -> 插件 -> 任务 -> 退出清理。
+///
+/// 字段按三组分区：
+/// - **内部变量**：框架私有，用户不可操作。
+/// - **用户可操作**：构建期开放（工厂与钩子）。
+/// - **上下文变量**：[`AppContext`]，插件就绪/收尾期（components_ready / finalize）
+///   与启动/关闭钩子的协作面（装配期 assemble 仅经 [`Extensions`]）。
 pub struct Application {
-    /// 自定义的 Tokio 运行时的创建工厂
-    tokio_runtime_factory: Option<TokioRuntimeFactory>,
-    /// 自定义的日志 layer 创建工厂列表
-    log_layers_factory: Vec<LogLayersFactory>,
-    /// 异步任务创建工厂列表
-    task_spawns_factory: Vec<TaskSpawnsFactory>,
-    /// 用户添加的默认配置
-    default_config: Vec<Value>,
+    // ==================== 内部变量（框架私有，用户不可操作）====================
     /// 注册的插件列表
     plugins: Vec<Box<dyn Plugin>>,
-    /// 启动钩子
-    startup_hooks: Vec<BoxFuture<anyhow::Result<()>>>,
-    /// 关闭钩子
-    shutdown_hooks: Vec<BoxFuture<anyhow::Result<()>>>,
-
-    /// 自定义主循环钩子
-    main_loop_hook: Option<Box<dyn FnOnce(Application) + Send>>,
     /// 异步任务的取消令牌
     cancel_token: Option<CancellationToken>,
     /// app核心管理任务句柄
     core_task_handle: Option<tokio::task::JoinHandle<()>>,
-
     /// Tokio 运行时
     tokio_runtime: Option<tokio::runtime::Runtime>,
-
     /// 日志守卫 (必须持有以保证异步日志不丢失)
     log_guard: Option<WorkerGuard>,
 
-    /// 扩展存储容器（AnyMap），供插件挂载自定义数据
-    extensions: Extensions,
+    // ==================== 用户可操作（构建期开放）====================
+    /// 自定义的 Tokio 运行时的创建工厂
+    tokio_runtime_factory: Option<TokioRuntimeFactory>,
+    /// 自定义的日志 layer 创建工厂列表
+    log_layers_factory: Vec<LogLayersFactory>,
+    /// 用户添加的默认配置 (优先级低于配置文件，但高于系统硬编码默认值)
+    default_config: Vec<Value>,
+    /// 启动钩子（插件 finalize 之后执行，接收应用上下文）
+    startup_hooks: Vec<StartupHook>,
+    /// 关闭钩子（组件销毁前执行，接收应用上下文）
+    shutdown_hooks: Vec<ShutdownHook>,
+    /// 自定义主循环钩子
+    main_loop_hook: Option<Box<dyn FnOnce(Application) + Send>>,
+
+    // ==================== 上下文变量（AppContext：插件与钩子的协作面）====================
+    /// 应用上下文（全局配置、组件容器、扩展存储、任务工厂注册器）
+    context: AppContext,
 }
 
 impl Application {
     /// 创建一个新的 Application 实例
     pub fn new() -> Self {
         Application {
-            tokio_runtime_factory: None,
-            log_layers_factory: Vec::new(),
-            task_spawns_factory: Vec::new(),
-            default_config: Vec::new(),
             plugins: Vec::new(),
-            startup_hooks: Vec::new(),
-            shutdown_hooks: Vec::new(),
-
-            main_loop_hook: None,
             cancel_token: None,
             core_task_handle: None,
-
             tokio_runtime: None,
-
             log_guard: None,
 
-            extensions: Extensions::new(),
+            tokio_runtime_factory: None,
+            log_layers_factory: Vec::new(),
+            default_config: Vec::new(),
+            startup_hooks: Vec::new(),
+            shutdown_hooks: Vec::new(),
+            main_loop_hook: None,
+
+            context: AppContext::new(),
         }
+    }
+
+    /// 获取应用上下文（插件与钩子的协作面：配置、组件容器、扩展存储、任务注册器）
+    pub fn context(&self) -> &AppContext {
+        &self.context
+    }
+
+    /// 获取可变的应用上下文
+    pub fn context_mut(&mut self) -> &mut AppContext {
+        &mut self.context
     }
 
     /// 获取不可变的 Tokio 运行时引用
@@ -97,43 +181,6 @@ impl Application {
     /// 获取可变的 Tokio 运行时引用
     pub fn get_runtime_as_mut(&mut self) -> &mut tokio::runtime::Runtime {
         self.tokio_runtime.as_mut().unwrap()
-    }
-
-    /// 获取存储的 Tokio 运行时的所有权
-    pub fn take_runtime(&mut self) -> tokio::runtime::Runtime {
-        self.tokio_runtime.take().unwrap()
-    }
-
-    /// 将 Tokio 运行时放到内部
-    pub fn set_runtime(&mut self, runtime: tokio::runtime::Runtime) {
-        self.tokio_runtime = Some(runtime);
-    }
-
-    /// 插入一个扩展值。
-    ///
-    /// 如果同类型已存在，返回旧值。
-    pub fn insert_extension<T: std::any::Any + Send>(&mut self, val: T) -> Option<T> {
-        self.extensions.insert(val)
-    }
-
-    /// 获取不可变的扩展引用。
-    pub fn get_extension<T: std::any::Any + Send>(&self) -> Option<&T> {
-        self.extensions.get::<T>()
-    }
-
-    /// 获取可变的扩展引用。
-    pub fn get_extension_mut<T: std::any::Any + Send>(&mut self) -> Option<&mut T> {
-        self.extensions.get_mut::<T>()
-    }
-
-    /// 移除并返回指定类型的扩展值。
-    pub fn remove_extension<T: std::any::Any + Send>(&mut self) -> Option<T> {
-        self.extensions.remove::<T>()
-    }
-
-    /// 检查是否包含指定类型的扩展。
-    pub fn contains_extension<T: std::any::Any + Send>(&self) -> bool {
-        self.extensions.contains::<T>()
     }
 
     /// 设置自定义的 Tokio 运行时的创建工厂
@@ -154,27 +201,6 @@ impl Application {
         self
     }
 
-    /// 注册一个异步任务创建工厂，应用启动时创建对应任务提交到运行时中
-    pub fn register_task_spawn_factory<F, Fut>(mut self, f: F) -> Self
-    where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-    {
-        self.task_spawns_factory
-            .push(Box::new(move |token| Box::pin(f(token))));
-        self
-    }
-
-    /// 在应用启动时的上下文中添加异步任务创建工厂(供插件使用)
-    pub fn add_task_spawn_factory_in_context<F, Fut>(&mut self, f: F)
-    where
-        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
-        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
-    {
-        self.task_spawns_factory
-            .push(Box::new(move |token| Box::pin(f(token))));
-    }
-
     /// 添加默认配置 (优先级低于配置文件，但高于系统硬编码默认值)
     pub fn add_default_config(mut self, config: Value) -> Self {
         self.default_config.push(config);
@@ -187,25 +213,41 @@ impl Application {
         self
     }
 
-    /// 添加启动后立即执行的钩子
-    pub fn add_startup_hook<F>(mut self, hook: F) -> Self
+    /// 添加启动钩子（插件 finalize 之后、后台任务消费之前执行）
+    ///
+    /// 钩子接收 `&mut AppContext`：可查询组件、读取配置、注册后台任务
+    /// （此时任务工厂尚未被消费，钩子内注册的任务依然生效）。
+    /// 闭包内的 Future 要求 'static，需访问容器/配置时先 clone Arc。
+    pub fn add_startup_hook<F, Fut>(mut self, hook: F) -> Self
     where
-        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+        F: FnOnce(&mut AppContext) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        self.startup_hooks.push(Box::pin(hook));
+        self.startup_hooks
+            .push(Box::new(move |ctx| Box::pin(hook(ctx))));
         self
     }
 
-    /// 添加关闭前执行的钩子
-    pub fn add_shutdown_hook<F>(mut self, hook: F) -> Self
+    /// 添加关闭钩子（组件销毁之前执行）
+    ///
+    /// 钩子接收 `&mut AppContext`：可查询组件、读取配置做清理前处理。
+    /// 闭包内的 Future 要求 'static，需访问容器/配置时先 clone Arc。
+    pub fn add_shutdown_hook<F, Fut>(mut self, hook: F) -> Self
     where
-        F: Future<Output = anyhow::Result<()>> + Send + 'static,
+        F: FnOnce(&mut AppContext) -> Fut + Send + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
     {
-        self.shutdown_hooks.push(Box::pin(hook));
+        self.shutdown_hooks
+            .push(Box::new(move |ctx| Box::pin(hook(ctx))));
         self
     }
 
     /// 设置自定义主循环 (例如用于 GUI 框架接管主线程)
+    ///
+    /// 钩子按值接收 `Application`，主循环结束后 Application 析构（Drop）时
+    /// 自动执行关闭流程。若主循环不返回（如 GUI 框架退出时经
+    /// `std::process::exit` 直接终止进程，跳过所有析构函数），Drop 不会触发，
+    /// 需在进程退出前手动 `drop(application)` 保证关闭流程确定性执行。
     pub fn set_main_loop_hook<F>(mut self, hook: F) -> Self
     where
         F: FnOnce(Application) + Send + 'static,
@@ -218,9 +260,16 @@ impl Application {
     ///
     /// 包含完整的初始化和生命周期管理。
     pub fn run(mut self) {
-        // 1. 加载全局配置
-        if let Err(e) = global_config_load(self.get_merged_default_config()) {
-            eprintln!("FATAL: Configuration Load Failed: {:?}", e);
+        // 1. 加载全局配置并写入应用上下文
+        let merged_config = match global_config_load(self.get_merged_default_config()) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("FATAL: Configuration Load Failed: {:?}", e);
+                return;
+            }
+        };
+        if self.context.set_config(Arc::new(merged_config)).is_err() {
+            eprintln!("FATAL: Failed to set global config (already initialized)");
             return;
         }
 
@@ -231,8 +280,8 @@ impl Application {
         }
 
         // 3. 读取并打印关键配置信息
-        let app_config: AppConfig =
-            AppCoreUtil::get_config_to_struct("app").log_expect("Failed to get app config");
+        let app_config: AppConfig = get_config_to_struct(self.context.config(), "app")
+            .log_expect("Failed to get app config");
         if let Some(ref profile) = app_config.profile {
             info!("Active configuration profile: '{}'", profile);
         } else {
@@ -248,14 +297,13 @@ impl Application {
         // 5. 执行启动方法
         if let Err(e) = self.start() {
             error!("Failed to start application: {:?}", e);
-            // 由于可能初始化了一些资源，这里调用shutdown方法清理已经创建的资源
-            self.shutdown();
+            // 已创建的资源由 Drop 兑底清理（见 Drop 实现）
             return;
         }
 
         // 6. 启动运行阶段
         let cancel_token = CancellationToken::new();
-        let task_spawns_factory = std::mem::take(&mut self.task_spawns_factory);
+        let task_spawns_factory = self.context.take_task_spawns();
         let has_main_loop_hook = self.main_loop_hook.is_some();
         if let Some(main_loop_hook) = self.main_loop_hook.take() {
             if inventory::iter::<CronJob>.into_iter().next().is_some()
@@ -279,7 +327,9 @@ impl Application {
                 self.core_task_handle = Some(core_task_handle);
             }
             main_loop_hook(self);
-            // 需要用户自己寻找时机调用shutdown方法
+            // Application 所有权移交主循环钩子，主循环结束析构时自动执行关闭流程
+            // （见 Drop 实现）。若主循环不返回（进程经 std::process::exit 直接退出），
+            // 不会析构，此时需由用户在进程退出前手动 drop(application) 兑底。
         } else {
             // 没有自定义主循环，将app核心管理任务作为主循环任务执行
             self.tokio_runtime
@@ -292,8 +342,7 @@ impl Application {
                     has_main_loop_hook,
                     shutdown_signal(),
                 ));
-            // 核心任务结束执行清理操作
-            self.shutdown();
+            // 核心任务结束后，由 Drop 兑底执行清理（见 Drop 实现）
         }
     }
 
@@ -344,7 +393,7 @@ impl Application {
     ///
     /// 构建顺序：基础 Filter → 时间格式与时区 → 内置控制台/文件层 → 用户自定义层。
     fn init_tracing(&mut self) -> anyhow::Result<()> {
-        let logger_config: LoggerConfig = AppCoreUtil::get_config_to_struct("logger")?;
+        let logger_config: LoggerConfig = get_config_to_struct(self.context.config(), "logger")?;
 
         // 1. 基础 Filter, 对所有layer生效
         let log_level = tracing::Level::from_str(&logger_config.level)
@@ -455,7 +504,7 @@ impl Application {
             info!("Tokio runtime initialized");
         } else {
             // 否则根据配置创建运行时
-            let runtime_config: RuntimeConfig = AppCoreUtil::get_config_to_struct("runtime")?;
+            let runtime_config: RuntimeConfig = get_config_to_struct(self.context.config(), "runtime")?;
             let thread_name = runtime_config.worker_thread_name;
 
             let rt = match runtime_config.worker_thread_num {
@@ -579,7 +628,7 @@ impl Application {
     /// 3. 组件加载：注册 → 建图拓扑排序后按序创建 → 统一初始化
     /// 4. 插件 components_ready：获取组件、注入协作结构
     /// 5. 插件 finalize：消费注册表、构建并启动服务
-    /// 6. 启动钩子
+    /// 6. 启动钩子（接收应用上下文）
     fn start(&mut self) -> anyhow::Result<()> {
         // 1. 插件排序（同步）
         if !self.plugins.is_empty() {
@@ -598,9 +647,10 @@ impl Application {
         let app = &mut *self;
 
         let result = rt.block_on(async move {
-            // 3. 插件 assemble（装配期：装配扩展注册表）
+            // 3. 插件 assemble（装配期：只授予扩展存储，装配扩展注册表）
             for plugin in plugins.iter_mut() {
-                match plugin.assemble(app).await {
+                let extensions = app.context.extensions_mut();
+                match plugin.assemble(extensions).await {
                     Ok(_) => {
                         if plugin.should_log() {
                             info!("Plugin assembled: [{}]", plugin.name());
@@ -616,16 +666,21 @@ impl Application {
                 }
             }
 
-            // 4. 组件加载 (Inventory 模式)
+            // 4. 组件加载 (Inventory 模式)：容器加载组件并完成全部生命周期阶段
             if has_inventory_components {
-                if let Err(e) = component_repository_load().await {
+                let config = app
+                    .context
+                    .config()
+                    .clone();
+                if let Err(e) = app.context.container().load(config).await {
                     return Err(anyhow!("Component repository load failed: {:?}", e));
                 }
             }
 
             // 5. 插件 components_ready（组件就绪期：获取组件、注入协作结构）
             for plugin in plugins.iter_mut() {
-                match plugin.components_ready(app).await {
+                let ctx = &mut app.context;
+                match plugin.components_ready(ctx).await {
                     Ok(_) => {
                         if plugin.should_log() {
                             info!("Plugin components ready: [{}]", plugin.name());
@@ -643,7 +698,8 @@ impl Application {
 
             // 6. 插件 finalize（收尾期：消费注册表、构建并启动服务）
             for plugin in plugins.iter_mut() {
-                match plugin.finalize(app).await {
+                let ctx = &mut app.context;
+                match plugin.finalize(ctx).await {
                     Ok(_) => {
                         if plugin.should_log() {
                             info!("Plugin finalized: [{}]", plugin.name());
@@ -659,10 +715,10 @@ impl Application {
                 }
             }
 
-            // 7. 启动钩子
+            // 7. 启动钩子（接收应用上下文；此时任务工厂尚未消费，钩子内可继续注册任务）
             if !startup_hooks.is_empty() {
                 for hook in startup_hooks.drain(..) {
-                    if let Err(e) = hook.await {
+                    if let Err(e) = hook(&mut app.context).await {
                         return Err(anyhow!("Startup hook failed: {:?}", e));
                     }
                 }
@@ -686,7 +742,8 @@ impl Application {
     }
 
     /// 关闭流程, 关闭流程中出现错误只打印错误不退出程序, 让每个关闭函数都能执行
-    pub fn shutdown(&mut self) {
+    /// 仅由 Drop 兑底调用；进程绕过析构直接终止时不会执行（见 Drop 实现）。
+    fn shutdown(&mut self) {
         if let Some(rt) = self.tokio_runtime.as_ref() {
             rt.block_on(async {
                 // 发起异步任务取消指令
@@ -704,11 +761,11 @@ impl Application {
                     }
                 }
 
-                // 执行用户关闭钩子
+                // 执行用户关闭钩子（接收应用上下文；此时组件尚未销毁）
                 if !self.shutdown_hooks.is_empty() {
                     let mut shutdown_hooks = std::mem::take(&mut self.shutdown_hooks);
                     for hook in shutdown_hooks.drain(..) {
-                        if let Err(e) = hook.await {
+                        if let Err(e) = hook(&mut self.context).await {
                             error!("Shutdown hook failed: {:?}", e);
                         }
                     }
@@ -728,8 +785,8 @@ impl Application {
                 }
 
                 //如果组件仓库不为空，则销毁所有组件，这里判断组件仓库而不是收集的组件构造器是因为可能有运行时加进来的组件
-                if !COMPONENT_REPOSITORY.is_empty() {
-                    if let Err(e) = shutdown_components().await {
+                if !self.context.container().is_empty() {
+                    if let Err(e) = self.context.container().shutdown().await {
                         error!("Failed to destroy components: {:?}", e);
                     }
                 }
@@ -737,6 +794,22 @@ impl Application {
                 info!("Application shutdown completed. Bye!");
             });
         }
+    }
+}
+
+impl Drop for Application {
+    /// 应用程序销毁时自动执行关闭流程（兑底）
+    ///
+    /// - 运行期字段（`tokio_runtime`、`log_guard`、`context` 等）在 `Drop::drop`
+    ///   执行完毕后由编译器按声明逆序自动销毁，无需（也不应）手动补充字段 drop。
+    /// - 此处 `block_on` 完整异步关闭流程（取消任务 → 关闭钩子 → 插件关闭 → 组件销毁）。
+    /// - 约束：`Application` 不能在 Tokio 运行时上下文内 drop（否则 `block_on` panic）；
+    ///   GUI 主线程与 CLI 主线程场景均满足。
+    /// - 关闭流程仅在析构发生时兑底：若宿主进程绕过析构直接终止（如 GUI 框架
+    ///   退出时经 `std::process::exit` 结束进程），需在终止前手动 `drop(application)`
+    ///   触发本实现，保证关闭流程确定性执行一次。
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

@@ -4,6 +4,7 @@
 //! 使得分散在各个模块中的 Controller 可以自动注册到主路由中，解耦了路由定义与注册逻辑。
 
 use axum::Router;
+use simple_starter_core::ComponentContainer;
 
 /// 路由工厂结构体
 ///
@@ -12,7 +13,9 @@ pub struct RouteFactory {
     /// 路由构建函数
     ///
     /// 此函数在应用启动阶段被调用，返回该模块对应的 Router 实例。
-    pub router: fn() -> Router,
+    /// 接收组件容器引用：rest controller 的路由构建需要经容器获取
+    /// controller 组件实例作为 axum State。
+    pub router: fn(&ComponentContainer) -> Router,
 }
 
 // 使用 inventory 宏进行收集

@@ -11,7 +11,7 @@ use syn::{GenericArgument, ItemImpl, PathArguments};
 ///    复用 trait 注入机制（`#[inject] Vec<Arc<dyn EventListener<E>>>` 可正常注入），
 ///    组件 create 后 `populate_trait_obj_cache` 填充 `TRAIT_OBJ_CACHE`；
 /// 2. `EventListenerRegistration`：事件类型 ↔ 实现组件的监听器注册，
-///    发布器 init 阶段遍历收集构建事件类型索引。
+///    发布器在容器就绪批次（`after_all_ready`）遍历收集构建事件类型索引。
 pub(crate) fn event_listener_on_impl(
     _args: TokenStream,
     item_impl: ItemImpl,

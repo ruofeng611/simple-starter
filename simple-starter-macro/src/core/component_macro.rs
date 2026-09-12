@@ -113,7 +113,7 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
 
                     primary_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#inner_type>() });
                     field_injections.push(quote! {
-                        #field_ident: ::simple_starter_core::AppCoreUtil::get_primary_component::<#inner_type>()?
+                        #field_ident: container.get_primary_component::<#inner_type>()?
                     });
                     continue;
                 }
@@ -126,7 +126,7 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
                     trait_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#trait_type>() });
 
                     let retrieval = quote! {
-                        ::simple_starter_core::AppCoreUtil::get_components_by_trait::<#trait_type>()?
+                        container.get_components_by_trait::<#trait_type>()?
                     };
                     field_injections.push(quote! { #field_ident: #retrieval });
 
@@ -140,14 +140,14 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
                         // 不需要 trait TypeId 依赖（避免对其他无关实现建立虚假依赖边）
                         dependencies_names.push(name.clone());
                         field_injections.push(quote! {
-                            #field_ident: ::simple_starter_core::AppCoreUtil::get_component_by_trait_and_name::<#trait_type>(#name)?
+                            #field_ident: container.get_component_by_trait_and_name::<#trait_type>(#name)?
                         });
                     } else {
                         // 按 trait 注入：依赖所有实现，通过 TypeId 解析
                         // trait_type 已是 Type::TraitObject，无需再加 dyn 前缀
                         trait_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#trait_type>() });
                         field_injections.push(quote! {
-                            #field_ident: ::simple_starter_core::AppCoreUtil::get_component_by_trait::<#trait_type>()?
+                            #field_ident: container.get_component_by_trait::<#trait_type>()?
                         });
                     }
 
@@ -171,12 +171,12 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
                     let retrieval_code = if let Some(name) = inject_name {
                         dependencies_names.push(name.clone());
                         quote! {
-                            ::simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?
+                            container.get_component_by_name::<#inner_type, _>(#name)?
                         }
                     } else {
                         type_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#inner_type>() });
                         quote! {
-                            ::simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?
+                            container.get_component::<#inner_type>()?
                         }
                     };
                     field_injections.push(quote! { #field_ident: #retrieval_code });
@@ -210,7 +210,7 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
         }
     };
     let create_fn_impl = quote! {
-        Box::new(move || -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#struct_name>> {
+        Box::new(move |container: std::sync::Arc<::simple_starter_core::ComponentContainer>, _config: std::sync::Arc<::simple_starter_core::toml::Value>| -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#struct_name>> {
             Box::pin(async move {
                 #instance_construct
                 Ok(instance)

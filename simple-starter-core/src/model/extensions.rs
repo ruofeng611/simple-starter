@@ -1,6 +1,6 @@
-//! 应用扩展存储（AnyMap）。
+//! # 应用扩展存储（AnyMap）
 //!
-//! 提供基于 `std::any::TypeId` 的类型安全擦除存储，允许在 `Application` 上
+//! 提供基于 `std::any::TypeId` 的类型安全擦除存储，允许在 `AppContext` 上
 //! 挂载任意插件自定义数据，实现插件间的上下文共享与解耦。
 
 use std::any::{Any, TypeId};

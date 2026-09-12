@@ -1,14 +1,16 @@
 //! 事件发布器：trait + 默认实现（框架内置，条件注册）。
 
-use crate::core::app_component::Injectable;
+use crate::model::component::Injectable;
+use crate::model::component::ComponentContainer;
+use crate::model::component::ComponentLifecycle;
 use crate::event::app_event::{AppEvent, EventListenerRegistration};
 use crate::event::event_listener::AnyEventListener;
-use crate::global_state::{TRAIT_OBJ_CACHE, TYPE_INSTANCE_NAMES};
-use crate::{component, injectable};
+use crate::utils::freeze_cell::FreezeCell;
+use crate::{component, injectable, lifecycle};
 use async_trait::async_trait;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::Arc;
 
 /// 事件发布器 trait。
 ///
@@ -41,30 +43,6 @@ pub trait EventPublisherExt: EventPublisher {
 
 impl<T: EventPublisher + ?Sized> EventPublisherExt for T {}
 
-/// 监听器条目。
-///
-/// 弱引用断环设计：监听器组件常通过 `#[inject] Arc<dyn EventPublisher>` 注入
-/// 发布器（对发布器持强引用）。若发布器再以强引用持有监听器，则两者互持
-/// 形成引用环：组件永远无法释放，且销毁阶段 `Arc::try_unwrap`（要求计数为 1）
-/// 必然失败。因此发布器对监听器仅存 Weak 断开此环——监听器组件由组件仓库
-/// 强持有至应用结束，Weak 随时可升级；销毁阶段仓库先释放监听器，
-/// 分派时 upgrade 失败即自动跳过。
-#[derive(Clone)]
-struct ListenerEntry {
-    /// 弱引用仓库中的组件实例，分派时经 adapter 还原为 `dyn AnyEventListener`。
-    /// 持弱引用而非强引用是为断开上述引用环（环的组成见结构体文档）。
-    weak: Weak<dyn Injectable>,
-    /// 类型桥接：`Arc<dyn Injectable>` → `Arc<dyn AnyEventListener>`（downcast 还原链路）。
-    adapter: fn(Arc<dyn Injectable>) -> Option<Arc<dyn AnyEventListener>>,
-}
-
-impl ListenerEntry {
-    /// 升级为可调用的监听器（升级失败或类型不匹配返回 `None`）。
-    fn upgrade_listener(&self) -> Option<Arc<dyn AnyEventListener>> {
-        (self.adapter)(self.weak.upgrade()?)
-    }
-}
-
 /// 默认事件发布器。
 ///
 /// 条件注册：仅当用户未提供任何 [`EventPublisher`] 实现时注册本默认实现，
@@ -72,37 +50,55 @@ impl ListenerEntry {
 ///
 /// 组件名显式指定为 `defaultEventPublisher`（而非结构体默认名），
 /// 遵循插件默认实现命名约束，避免与用户同名结构体在注册期撞名。
+///
+/// 监听器索引为强引用快照（见 [`DefaultEventPublisher::listeners`] 字段
+/// 文档）：`after_all_ready` 批次收集并冻结，`before_destroy` 批次清空。
 #[component(
     name = "defaultEventPublisher",
-    condition = crate::ComponentCondition::on_missing_trait::<dyn EventPublisher>(),
-    init_method = "collect_listeners"
+    condition = crate::ComponentCondition::on_missing_trait::<dyn EventPublisher>()
 )]
-pub struct DefaultEventPublisher {
-    /// 事件类型 → 监听器列表（保持收集顺序），init 阶段写入一次，之后只读。
-    listeners: OnceLock<HashMap<TypeId, Vec<ListenerEntry>>>,
+pub(crate) struct DefaultEventPublisher {
+    /// 事件类型 → 监听器列表（保持收集顺序）。
+    ///
+    /// 生命周期：`after_all_ready` 批次收集一次（`get_mut` 填充）→ 冻结
+    /// （运行期分派零锁读）→ `before_destroy` 批次清空一次（释放全部
+    /// 监听器强引用，断开"监听器 ↔ 发布器"引用环）。
+    listeners: FreezeCell<HashMap<TypeId, Vec<Arc<dyn AnyEventListener>>>>,
 }
 
 impl DefaultEventPublisher {
     /// 收集所有 `#[event_listener]` 注册的监听器，构建事件类型索引。
     ///
-    /// 在组件 init 阶段调用：全量组件 create 完成后 `TRAIT_OBJ_CACHE`
-    /// 与 `TYPE_INSTANCE_NAMES` 已填充，收集必然命中。
-    pub async fn collect_listeners(&self) -> anyhow::Result<()> {
-        let mut map: HashMap<TypeId, Vec<ListenerEntry>> = HashMap::new();
+    /// 由本组件 `after_all_ready` 批次调用（容器全部组件 create 完成后的
+    /// 冻结视图查询）：`trait_obj_cache` 与 `type_instance_names` 已填充，
+    /// 收集必然命中。
+    fn collect_listeners(&self, container: &ComponentContainer) -> anyhow::Result<()> {
+        let Some(map) = self.listeners.get_mut() else {
+            return Ok(()); // 索引已冻结（重复调用防御）
+        };
 
         for reg in inventory::iter::<EventListenerRegistration> {
             // 实现组件的全部已创建实例
-            let Some(names) = TYPE_INSTANCE_NAMES.get(&reg.impl_type_id) else {
+            let Some(names) = container
+                .type_instance_names
+                .get()
+                .and_then(|m| m.get(&reg.impl_type_id))
+            else {
                 continue;
             };
             for name in names.iter() {
                 let cache_key = (reg.listener_trait_type_id, name.clone());
-                let Some(arc) = TRAIT_OBJ_CACHE.get(&cache_key) else {
+                let Some(arc) = container
+                    .trait_obj_cache
+                    .get()
+                    .and_then(|m| m.get(&cache_key))
+                else {
                     continue;
                 };
-                // 验证 adapter 还原链路可通（失败时跳过），Weak 指向仓库持有的
-                // 组件实例（应用生命周期内有效），分派时再 upgrade + adapter 还原
-                let Some(listener) = (reg.adapter)(arc.value().obj.clone()) else {
+                // adapter 还原出 `Arc<dyn AnyEventListener>`，其内部即组件实例的
+                // 强引用：索引直接持有，分派免 upgrade；销毁前由 before_destroy
+                // 清空断环
+                let Some(listener) = (reg.adapter)(arc.obj.clone()) else {
                     continue;
                 };
                 // 登记日志：发布器收集到的监听器实例名与监听事件类型
@@ -111,16 +107,33 @@ impl DefaultEventPublisher {
                     name,
                     listener.event_type_id()
                 );
-                map.entry(reg.event_type_id).or_default().push(ListenerEntry {
-                    weak: Arc::downgrade(&arc.value().obj),
-                    adapter: reg.adapter,
-                });
+                map.entry(reg.event_type_id).or_default().push(listener);
             }
         }
+        Ok(())
+    }
+}
 
-        self.listeners
-            .set(map)
-            .map_err(|_| anyhow::anyhow!("Event listener index already initialized"))?;
+/// 容器级生命周期：监听器索引的收集与清空时机
+///
+/// - [`ComponentLifecycle::after_all_ready`]：全部组件就绪后收集监听器并
+///   冻结索引（此后运行期分派零锁读）
+/// - [`ComponentLifecycle::before_destroy`]：销毁前清空监听器强引用，
+///   断开"监听器 ↔ 发布器"引用环（组件销毁时 Arc 计数归 1）
+#[lifecycle]
+#[async_trait]
+impl ComponentLifecycle for DefaultEventPublisher {
+    async fn after_all_ready(&self, container: &Arc<ComponentContainer>) -> anyhow::Result<()> {
+        self.collect_listeners(container)?;
+        // 收集完成：冻结索引为不可变快照，此后运行期分派零锁读
+        self.listeners.freeze();
+        Ok(())
+    }
+
+    async fn before_destroy(&self, _container: &Arc<ComponentContainer>) -> anyhow::Result<()> {
+        // 清空监听器强引用：断开"监听器 ↔ 发布器"引用环（销毁循环前批次执行，
+        // 此时全部组件存活、无并发读者）
+        self.listeners.clear();
         Ok(())
     }
 }
@@ -132,7 +145,7 @@ impl EventPublisher for DefaultEventPublisher {
         // 完全限定语法取分桶键（AppEvent 内嵌 Any 槽位）
         let event_type_id = Any::type_id(&*event);
 
-        // init 阶段已收集；未初始化时按无监听器处理
+        // 收集阶段已写入（after_all_ready 批次）；未收集时按无监听器处理
         let listeners = self
             .listeners
             .get()
@@ -140,13 +153,8 @@ impl EventPublisher for DefaultEventPublisher {
             .cloned()
             .unwrap_or_default();
 
-        for entry in listeners {
-            // 升级为临时强引用，保证调用期间存活；组件已销毁（Weak 失效）则跳过。
-            // 这是 Weak 断环设计允许的行为：监听器生命周期由组件仓库独立管理，
-            // 发布器不参与监听器的存亡
-            let Some(listener) = entry.upgrade_listener() else {
-                continue;
-            };
+        for listener in listeners {
+            // 强引用监听器：before_destroy 清空前始终存活，直接分派
             if let Err(e) = listener.on_event_any(event.clone()).await {
                 tracing::error!(
                     "Event listener failed for '{}': {:#}",

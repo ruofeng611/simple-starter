@@ -8,7 +8,7 @@
 
 路由定义分散在各模块的 Controller 中，启动时**自动收集聚合**，无需在 `main` 集中挂载：
 
-1. 路由宏（`#[get]`、`#[rest_controller]` 等）在编译期把 handler 包装为 `RouteFactory`（`fn() -> Router`），通过 `inventory` 静态收集。
+1. 路由宏（`#[get]`、`#[rest_controller]` 等）在编译期把 handler 包装为 `RouteFactory`（`fn(&ComponentContainer) -> Router`，路由构建时查询 `State` 组件），通过 `inventory` 静态收集。
 2. `WebPlugin::finalize` 阶段消费 `WebExtensionRegistry`，注册延迟构建的后台任务。
 3. 服务启动时（`build_and_serve`）遍历 inventory 中全部 `RouteFactory`，`router.merge(...)` 合并为完整 Router。
 
@@ -28,7 +28,7 @@
 
 | 周期 | 行为 |
 |---|---|
-| `assemble` | 创建 `WebExtensionRegistry` 并放入 `Application` 扩展上下文，供其他插件注册中间件、路由修改器 |
+| `assemble` | 创建 `WebExtensionRegistry` 并移入扩展存储（`Extensions`），供其他插件注册中间件、路由修改器 |
 | `finalize` | 所有组件就绪后：加载 `web` 配置、取出注册表、从组件仓库获取 `TcpListenerFactory`、注册服务后台任务 |
 
 ### 4. Controller 参数重写原理
@@ -67,7 +67,13 @@ fn main() {
 参数支持简写 `#[get("/path")]` 与键值 `#[get(path = "/path", state = expr)]`：
 
 ```rust
-#[get(path = "/student/{id}", state = AppCoreUtil::get_component::<StudentService>().unwrap())]
+#[get(
+    path = "/student/{id}",
+    state = simple_starter_core::app_container()
+        .expect("global container snapshot must be installed before route registration")
+        .get_component::<StudentService>()
+        .expect("StudentService component must be registered")
+)]
 #[json_response]  // 自动将返回值包装为 Json
 async fn get_student_name(
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -157,11 +163,11 @@ impl TcpListenerFactory for TlsListenerFactory {
 
 #### WebExtensionRegistry（路由/中间件扩展）
 
-供其他插件在 `assemble` 阶段通过应用上下文获取并注册扩展：
+供其他插件在 `assemble` 阶段经扩展存储（`assemble` 参数）获取并注册扩展：
 
 ```rust
-async fn assemble(&mut self, ctx: &mut Application) -> anyhow::Result<()> {
-    ctx.get_extension_mut::<WebExtensionRegistry>()?
+async fn assemble(&mut self, extensions: &mut simple_starter_core::Extensions) -> anyhow::Result<()> {
+    extensions.get_mut::<WebExtensionRegistry>()?
         .add_middleware(|router| router.layer(CompressionLayer::new()));
     Ok(())
 }

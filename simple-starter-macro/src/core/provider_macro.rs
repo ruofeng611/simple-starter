@@ -114,7 +114,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
 
                     primary_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#inner_type>() });
                     arg_preparations.push(quote! {
-                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_primary_component::<#inner_type>()?;
+                        let #arg_var_name = container.get_primary_component::<#inner_type>()?;
                     });
                 } else if is_vec_arc_dyn_trait(&pat_type.ty) {
                     // Vec<Arc<dyn Trait>>
@@ -122,7 +122,7 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                     let trait_type = trait_object_to_type(trait_obj);
                     trait_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#trait_type>() });
                     arg_preparations.push(quote! {
-                        let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_components_by_trait::<#trait_type>()?;
+                        let #arg_var_name = container.get_components_by_trait::<#trait_type>()?;
                     });
 
                 } else if is_arc_dyn_trait(&pat_type.ty) {
@@ -135,13 +135,13 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                         // 不需要 trait TypeId 依赖（避免对其他无关实现建立虚假依赖边）
                         dependencies_names.push(name.clone());
                         arg_preparations.push(quote! {
-                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_trait_and_name::<#trait_type>(#name)?;
+                            let #arg_var_name = container.get_component_by_trait_and_name::<#trait_type>(#name)?;
                         });
                     } else {
                         // 按 trait 注入：依赖所有实现，通过 TypeId 解析
                         trait_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#trait_type>() });
                         arg_preparations.push(quote! {
-                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_trait::<#trait_type>()?;
+                            let #arg_var_name = container.get_component_by_trait::<#trait_type>()?;
                         });
                     }
 
@@ -162,12 +162,12 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
                     if let Some(name) = inject_name {
                         dependencies_names.push(name.clone());
                         arg_preparations.push(quote! {
-                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component_by_name::<#inner_type, _>(#name)?;
+                            let #arg_var_name = container.get_component_by_name::<#inner_type, _>(#name)?;
                         });
                     } else {
                         type_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#inner_type>() });
                         arg_preparations.push(quote! {
-                            let #arg_var_name = ::simple_starter_core::AppCoreUtil::get_component::<#inner_type>()?;
+                            let #arg_var_name = container.get_component::<#inner_type>()?;
                         });
                     }
                 }
@@ -180,9 +180,9 @@ pub(crate) fn provider_macro(args: TokenStream, input: TokenStream) -> TokenStre
     // 4. 生成 Wrapper 构造逻辑
     let func_name = &func.sig.ident;
 
-    // Create Fn: 包装原函数调用
+    // Create Fn: 包装原函数调用（接收容器与全局配置，注入参数经容器解析）
     let create_fn_impl = quote! {
-        Box::new(move || -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#component_type>> {
+        Box::new(move |container: std::sync::Arc<::simple_starter_core::ComponentContainer>, _config: std::sync::Arc<::simple_starter_core::toml::Value>| -> ::simple_starter_core::BoxFuture<::simple_starter_core::anyhow::Result<#component_type>> {
             Box::pin(async move {
                 // 先准备所有参数
                 #(#arg_preparations)*

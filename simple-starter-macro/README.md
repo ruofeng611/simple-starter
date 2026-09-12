@@ -67,7 +67,7 @@ pub struct DefaultCacheService;
 | 参数 | 说明 |
 |---|---|
 | `name` | 组件名（默认用结构体短名） |
-| `init_method` | 初始化方法名（所有组件创建完成后按序调用）。对应签名 `async fn init(&self)`：以共享引用调用，实例所有权仍在仓库，仅能读取/借用自身 |
+| `init_method` | 初始化方法名（注入完成后立即执行，拓扑序保证依赖组件先完成初始化）。对应签名 `async fn init(&self)`：以共享引用调用，实例所有权仍在仓库，仅能读取/借用自身 |
 | `destroy_method` | 销毁方法名（退出时按创建逆序调用）。对应签名 `async fn destroy(self)`：以「有所有权」的实例调用，可消费字段、取出内部资源 |
 | `condition` | 注册条件表达式（不满足则不注册） |
 

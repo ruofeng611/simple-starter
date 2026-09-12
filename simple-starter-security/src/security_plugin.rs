@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use simple_starter_core::{AppCoreUtil, Application, Injectable, Plugin, anyhow};
+use serde::Deserialize;
+use simple_starter_core::{AppContext, Extensions, Injectable, Plugin, anyhow};
 use simple_starter_web::{WebExtensionRegistry, axum};
 use toml::Value;
 
@@ -23,20 +24,23 @@ pub trait BasePathProvider: Injectable {
 
 /// 默认基础路径提供者。
 ///
-/// 从 TOML 配置的 `web.base_path` 读取基础路径，若未配置则返回空字符串。
+/// 作为配置组件从 TOML 的 `web` 节点反序列化，基础路径取自 `web.base_path`，
+/// 若未配置则返回空字符串。
 ///
 /// 以条件注册方式参与组件装配：当用户未提供任何 [`BasePathProvider`] 实现时注册本默认实现，
 /// 否则自动退位让位给用户实现。
-#[simple_starter_macro::component(condition = simple_starter_core::ComponentCondition::on_missing_trait::<dyn BasePathProvider>())]
-pub struct DefaultBasePathProvider;
+#[derive(Deserialize)]
+#[simple_starter_macro::configuration(prefix = "web", condition = simple_starter_core::ComponentCondition::on_missing_trait::<dyn BasePathProvider>())]
+pub struct DefaultBasePathProvider {
+    /// 全局 API 路径前缀（对应配置 `web.base_path`），未配置时为 None
+    #[serde(default)]
+    pub base_path: Option<String>,
+}
 
 #[simple_starter_macro::injectable]
 impl BasePathProvider for DefaultBasePathProvider {
     fn base_path(&self) -> String {
-        AppCoreUtil::get_config_value_by_path("web.base_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
+        self.base_path.clone().unwrap_or_default()
     }
 }
 
@@ -110,9 +114,9 @@ impl Plugin for SecurityPlugin {
 
     /// 装配期。
     ///
-    /// 校验 WebPlugin 已将 `WebExtensionRegistry` 装配进应用上下文（fail-fast 早于组件加载）。
-    async fn assemble(&mut self, ctx: &mut Application) -> anyhow::Result<()> {
-        ctx.get_extension::<WebExtensionRegistry>().ok_or_else(|| {
+    /// 校验 WebPlugin 已将 `WebExtensionRegistry` 装配进扩展存储（fail-fast 早于组件加载）。
+    async fn assemble(&mut self, extensions: &mut Extensions) -> anyhow::Result<()> {
+        extensions.get::<WebExtensionRegistry>().ok_or_else(|| {
             anyhow::anyhow!("WebExtensionRegistry not found. Did WebPlugin assemble?")
         })?;
         Ok(())
@@ -120,25 +124,27 @@ impl Plugin for SecurityPlugin {
 
     /// 组件就绪期。
     ///
-    /// 从组件仓库获取四个协作接口实例（默认实现经条件注册保证存在、用户实现存在时自动退位），
+    /// 从组件容器获取四个协作接口实例（默认实现经条件注册保证存在、用户实现存在时自动退位），
     /// 构建资源映射表与安全中间件状态，并注册到 WebPlugin 的 `WebExtensionRegistry`。
-    async fn components_ready(&mut self, ctx: &mut Application) -> anyhow::Result<()> {
-        // 读取是否打印警告日志的配置
-        let log_warn = AppCoreUtil::get_config_value_by_path("security.log_warn")
+    async fn components_ready(&mut self, ctx: &mut AppContext) -> anyhow::Result<()> {
+        // 读取是否打印警告日志的配置（经 AppContext）
+        let log_warn = ctx
+            .get_config_value_by_path("security.log_warn")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // 提前 clone 容器 Arc（避免与下方 registry 可变借用重叠）
+        let container = ctx.container().clone();
 
         let registry = ctx.get_extension_mut::<WebExtensionRegistry>().ok_or_else(|| {
             anyhow::anyhow!("WebExtensionRegistry not found. Did WebPlugin assemble?")
         })?;
 
         // 获取组件：默认实现按条件注册保证存在；UserInfoProvider 无默认实现，获取失败降级为 None（拒绝所有请求）
-        let base_path_provider =
-            AppCoreUtil::get_component_by_trait::<dyn BasePathProvider>()?;
-        let permission_checker = AppCoreUtil::get_component_by_trait::<dyn PermissionChecker>()?;
-        let error_handler = AppCoreUtil::get_component_by_trait::<dyn SecurityErrorHandler>()?;
-        let user_info_provider =
-            AppCoreUtil::get_component_by_trait::<dyn UserInfoProvider>().ok();
+        let base_path_provider = container.get_component_by_trait::<dyn BasePathProvider>()?;
+        let permission_checker = container.get_component_by_trait::<dyn PermissionChecker>()?;
+        let error_handler = container.get_component_by_trait::<dyn SecurityErrorHandler>()?;
+        let user_info_provider = container.get_component_by_trait::<dyn UserInfoProvider>().ok();
 
         // 构建资源映射表：path_pattern -> resource_id
         let base_path = base_path_provider.base_path();

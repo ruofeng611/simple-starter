@@ -1,6 +1,6 @@
 //! 应用事件：事件标记 trait 与监听器注册结构。
 
-use crate::core::app_component::Injectable;
+use crate::model::component::Injectable;
 use crate::event::event_listener::AnyEventListener;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
@@ -16,7 +16,8 @@ impl<T: Any + Send + Sync> AppEvent for T {}
 
 /// 编译期事件监听器注册，由 `#[event_listener]` 宏在 impl 块上生成。
 ///
-/// 发布器 init 阶段遍历收集，按事件类型 `event_type_id` 构建监听器索引。
+/// 发布器在容器就绪批次（`after_all_ready`）遍历收集，按事件类型
+/// `event_type_id` 构建监听器索引。
 pub struct EventListenerRegistration {
     /// `TypeId::of::<E>()`：监听的事件类型
     pub event_type_id: TypeId,

@@ -246,7 +246,7 @@ fn main() {
         .register_plugin(SecurityPlugin::new()
             .add_whitelist(Some("GET"), "/health"))
         // 启动钩子：组件就绪后初始化权限数据（user_id "1" 拥有全部资源权限）
-        .add_startup_hook(async {
+        .add_startup_hook(|_ctx| async move {
             let resources = SecurityPlugin::collect_resources();
             // 把全部 resource_id 授权给 user_id "1" ...
             Ok(())

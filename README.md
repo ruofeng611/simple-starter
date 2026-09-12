@@ -11,7 +11,7 @@
 - **分布式路由**：Web 路由分散定义，启动时自动收集聚合，无需集中挂载
 - **声明式定时任务**：`#[cron_job]` 直接在函数上定义定时任务
 - **分层配置系统**：`application.toml` 与多环境 Profile 自动合并
-- **插件系统**：`assemble` / `components_ready` / `finalize` 三阶段生命周期，插件间通过扩展上下文解耦协作
+- **插件系统**：`assemble` / `components_ready` / `finalize` 三阶段生命周期，装配期经扩展存储解耦协作
 - **事件系统**：Spring 风格事件发布/监听，监听器自动收集、按事件类型分桶分派
 - **安全能力**：编译期资源收集、运行时白名单、用户认证与权限校验
 
@@ -36,7 +36,7 @@ simple-starter-web（Axum Web 集成，依赖 core + macro）
 simple-starter-security（安全中间件，依赖 core + web）
 ```
 
-- **simple-starter-core**：框架的核心引擎，不依赖任何业务模块。采用 serde 模式依赖并重导出核心宏，用户只需依赖 core 即可使用 `#[component]` 等宏。
+- **simple-starter-core**：框架的核心引擎，不依赖任何业务模块。依赖并重导出核心宏，用户只需依赖 core 即可使用 `#[component]` 等宏。
 - **simple-starter-macro**：纯过程宏 crate，展开代码通过绝对路径（`::simple_starter_core::...`、`::simple_starter_web::...`、`::simple_starter_security::...`）引用运行时，自身零依赖。注意：过程宏 crate 只能导出宏，普通类型由各自模块导出。
 - **simple-starter-web**：依赖 core，重导出 Web 相关宏。
 - **simple-starter-security**：依赖 core + web，重导出安全相关宏。

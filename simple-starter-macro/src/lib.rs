@@ -4,6 +4,7 @@ mod core {
     pub(crate) mod cron_job_macro;
     pub(crate) mod event_listener_macro;
     pub(crate) mod injectable_macro;
+    pub(crate) mod lifecycle_macro;
     pub(crate) mod primary_macro;
     pub(crate) mod provider_macro;
 }
@@ -95,7 +96,7 @@ pub fn provider(args: TokenStream, item: TokenStream) -> TokenStream {
 /// 标记首要（primary）实例。
 ///
 /// 必须与 `#[provider]` 一起标注在同一函数上，声明该函数返回值类型的首要实例：
-/// 当框架按类型获取组件时优先返回它（见 `AppCoreUtil::get_primary_component`）。
+/// 当框架按类型获取组件时优先返回它（见 `ComponentContainer::get_primary_component`）。
 /// 由于存在 primary 通常意味着同类型有多个实例，因此必须显式指定实例名，
 /// 且该名字必须与 `#[provider]` 注册的组件名一致。
 ///
@@ -164,10 +165,48 @@ pub fn cron_job(args: TokenStream, item: TokenStream) -> TokenStream {
     core::cron_job_macro::cron_job_macro(args, item)
 }
 
+/// 注册容器级生命周期回调实现。
+///
+/// 作用在 `impl ComponentLifecycle for Type` 块上，将实现组件注册为容器级周期
+/// 参与者：全部 bean 完成注入与初始化后按创建顺序执行 `after_all_ready`
+/// （对应 Spring `SmartInitializingSingleton`），全部 bean 准备销毁之前按逆序
+/// 批次执行 `before_destroy`（对应 Spring `SmartLifecycle.stop()`，此时全局缓存
+/// 未清空、全部 bean 存活可互相解析）。两个方法均有默认空实现，按需覆写。
+///
+/// 用法：
+/// ```rust
+/// #[component]
+/// pub struct HealthChecker { ... }
+///
+/// #[lifecycle]
+/// #[async_trait::async_trait]
+/// impl ComponentLifecycle for HealthChecker {
+///     async fn after_all_ready(&self, container: &Arc<ComponentContainer>) -> anyhow::Result<()> {
+///         // 全部组件就绪后统一处理（如全局校验、启动后预热）
+///         Ok(())
+///     }
+/// }
+/// ```
+///
+/// 注意：
+/// - 必须搭配 `#[component]`（或 `#[provider]`）标注的结构体使用（实现组件需已注册）。
+/// - 回调签名带容器 `Arc` 引用（与 `AppContext::container()` 返回形态一致）：
+///   deref 直接查询，需传播所有权时显式 `.clone()`；声明式依赖仍走字段注入。
+#[proc_macro_attribute]
+pub fn lifecycle(args: TokenStream, item: TokenStream) -> TokenStream {
+    let item_impl = match syn::parse2::<syn::ItemImpl>(item.into()) {
+        Ok(impl_block) => impl_block,
+        Err(e) => return e.to_compile_error().into(),
+    };
+    core::lifecycle_macro::lifecycle_on_impl(args, item_impl)
+        .unwrap_or_else(|e| e.to_compile_error().into())
+}
+
 /// 注册事件监听器。
 ///
 /// 作用在 `impl EventListener<E> for Type` 块上，将实现组件注册为该事件类型的监听器：
-/// 发布器（默认 `DefaultEventPublisher`）在 init 阶段自动收集，事件发布时同步广播。
+/// 发布器（框架内置实现，用户可注册自己的 `EventPublisher` 实现覆盖）在容器
+/// 就绪批次（`after_all_ready`）自动收集，事件发布时同步广播。
 /// 同时生成 trait 实现映射，`#[inject] Vec<Arc<dyn EventListener<E>>>` 可正常注入。
 ///
 /// 用法：
