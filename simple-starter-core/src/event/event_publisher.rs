@@ -145,22 +145,23 @@ impl EventPublisher for DefaultEventPublisher {
         // 完全限定语法取分桶键（AppEvent 内嵌 Any 槽位）
         let event_type_id = Any::type_id(&*event);
 
-        // 收集阶段已写入（after_all_ready 批次）；未收集时按无监听器处理
-        let listeners = self
+        // 收集阶段已写入（after_all_ready 批次）；未收集时按无监听器处理。
+        // 直接借用索引内的 Arc 迭代（零克隆）：clear 仅在 before_destroy 批次
+        // 执行（销毁前框架已等待全部后台任务结束），与运行期分派无并发
+        if let Some(listeners) = self
             .listeners
             .get()
             .and_then(|map| map.get(&event_type_id))
-            .cloned()
-            .unwrap_or_default();
-
-        for listener in listeners {
-            // 强引用监听器：before_destroy 清空前始终存活，直接分派
-            if let Err(e) = listener.on_event_any(event.clone()).await {
-                tracing::error!(
-                    "Event listener failed for '{}': {:#}",
-                    std::any::type_name_of_val(event.as_ref()),
-                    e
-                );
+        {
+            for listener in listeners {
+                // 强引用监听器：before_destroy 清空前始终存活，直接分派
+                if let Err(e) = listener.on_event_any(event.clone()).await {
+                    tracing::error!(
+                        "Event listener failed for '{}': {:#}",
+                        std::any::type_name_of_val(event.as_ref()),
+                        e
+                    );
+                }
             }
         }
         Ok(())

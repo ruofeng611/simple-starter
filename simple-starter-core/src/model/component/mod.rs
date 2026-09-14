@@ -311,23 +311,28 @@ impl<T: Any + Send + Sync> ComponentProcessor for ComponentWrapper<T> {
     }
 
     async fn destroy(&mut self) -> anyhow::Result<()> {
-        if let Some(destroy_fn) = self.destroy_fn.take() {
-            if let Some(arc_t) = self.inner.take() {
-                // 与 init 传入 Arc 共享引用不同：destroy 尝试解包 Arc 拿到
-                // 「有所有权」的实例 T（对应用户方法 self 签名），供销毁逻辑
-                // 消费字段、取出内部资源。只有当引用计数为 1 时（即没有
-                // 其他地方持有该组件），才能成功解包并安全销毁
-                match Arc::try_unwrap(arc_t) {
-                    Ok(t) => {
-                        // 成功拿到 T 的所有权，执行销毁逻辑
+        // 销毁阶段所有权已从仓库移出：无论组件是否注册了销毁逻辑，
+        // 都先尝试解包 Arc 校验引用计数为 1，及早暴露引用泄漏——
+        // 未实现 destroy 的组件若被其他持有者引用（计数 > 1），实例
+        // 同样无法释放，报错让开发者感知，而非静默泄漏
+        if let Some(arc_t) = self.inner.take() {
+            // 与 init 传入 Arc 共享引用不同：destroy 尝试解包 Arc 拿到
+            // 「有所有权」的实例 T（对应用户方法 self 签名），供销毁逻辑
+            // 消费字段、取出内部资源。只有当引用计数为 1 时（即没有
+            // 其他地方持有该组件），才能成功解包并安全销毁
+            match Arc::try_unwrap(arc_t) {
+                Ok(t) => {
+                    // 成功拿到 T 的所有权：若注册了销毁逻辑则执行
+                    // （消费实例）；否则实例随 t 在此作用域结束自然释放
+                    if let Some(destroy_fn) = self.destroy_fn.take() {
                         destroy_fn(t).await?;
                     }
-                    Err(_arc_t) => {
-                        // 失败：说明还有其他地方持有这个 Arc（可能是因为循环引用或逻辑泄露）
-                        return Err(anyhow::anyhow!(
-                            "Cannot destroy component: it is still in use by others (Arc strong_count > 1)"
-                        ));
-                    }
+                }
+                Err(_arc_t) => {
+                    // 失败：说明还有其他地方持有这个 Arc（可能是因为循环引用或逻辑泄露）
+                    return Err(anyhow::anyhow!(
+                        "Cannot destroy component: it is still in use by others (Arc strong_count > 1)"
+                    ));
                 }
             }
         }

@@ -15,7 +15,7 @@
 5. **初始化**：每个组件创建完成后**立即**执行 `init_method`（注入完成后即执行，对应 Spring `@PostConstruct`；拓扑序保证依赖组件先完成 create + init，init 内可安全访问全部依赖组件）。方法签名 `async fn init(&self)`：以 `Arc<T>` 共享引用调用，实例所有权仍在仓库，仅能读取/借用自身。
 6. **容器就绪批次（可选）**：全部组件创建 + 初始化完成后，按创建序批次执行 `ComponentLifecycle::after_all_ready`（对应 Spring `SmartInitializingSingleton`）。
 7. **销毁前批次（可选）**：退出时先按创建序逆序批次执行 `ComponentLifecycle::before_destroy`（此时全局缓存未清空、全部组件存活可互相解析），再进入逐组件销毁。
-8. **销毁**：按创建序的逆序执行 `destroy_method`。方法签名 `async fn destroy(self)`：与 init 不同，以「有所有权」的实例 `T` 调用，所有权已从仓库移出，可消费字段、取出内部资源（要求此时无其他地方持有该实例，即 `Arc` 计数为 1）。
+8. **销毁**：按创建序的逆序执行 `destroy_method`。方法签名 `async fn destroy(self)`：与 init 不同，以「有所有权」的实例 `T` 调用，所有权已从仓库移出，可消费字段、取出内部资源。销毁时要求无其他地方持有该实例（`Arc` 计数为 1），且无论组件是否实现 `destroy_method` 都强制校验：引用泄漏（计数 > 1）将报错暴露，而非静默不释放。
 
 ### 2. 依赖注入
 
