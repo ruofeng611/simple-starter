@@ -524,8 +524,9 @@ fn topo_sort_creation(graph: &CreationGraph) -> anyhow::Result<Vec<String>> {
 /// 创建单个组件
 ///
 /// 采用 temporarily remove 模式执行 create：先取出处理器所有权（释放对仓库
-/// 冻结单元的借用），await 期间 create 回调可读容器做构造器注入（FreezeCell
-/// BUILDING 期读写不得重叠的契约），完成后插回。
+/// 冻结单元的借用），await 期间 create 回调可读容器做构造器注入（poll 段守卫
+/// 放行装配任务自身；写侧借用经 temporarily remove 不跨 await，读写不重叠），
+/// 完成后插回。
 /// 创建完成后立即填充 trait object 缓存（依赖者 create 阶段即可
 /// 按 trait 获取），并记录创建顺序（销毁时逆序使用）。
 async fn create_one(
@@ -579,7 +580,8 @@ async fn create_one(
 /// 在 [`create_one`] 之后立即调用（init 语义：注入完成后即执行，对应 Spring
 /// `@PostConstruct`）。采用 temporarily remove 模式执行 init：先取出处理器
 /// 所有权（释放对仓库冻结单元的借用），await 期间 init 回调可读容器
-/// （FreezeCell BUILDING 期读写不得重叠的契约），完成后插回。
+/// （poll 段守卫放行装配任务自身；写侧借用经 temporarily remove 不跨 await，
+/// 读写不重叠），完成后插回。
 async fn init_one(container: &ComponentContainer, name: &str) -> anyhow::Result<()> {
     let mut processor = container
         .repository

@@ -477,32 +477,48 @@ graph TD
 
 > **安全窗口的定位**：本节安全窗口指的是**通过容器获取组件**（查询）的窗口，**不是组件实例本身的安全访问窗口**——实例经 `Arc` 保活：一旦拿到 `Arc<T>`，实例数据只读访问不受窗口限制（持有者随时可读）；销毁期对仍被持有的实例，框架以计数校验报错兑底而非释放，实例访问始终安全（代价是报错/泄漏，而非 UB）。
 >
-> **入口分档**：框架主动传入容器引用的时机（钩子参数 `&Arc<ComponentContainer>`、`AppContext::container()`、字段注入）都处于查询安全窗口内——**收到引用即可放心查询，无需额外判断窗口**；需要自行判断窗口的只有无框架时机保证的全局快照入口（`app_container()` 开区间）。
+> **入口分档**：框架主动传入容器引用的时机（钩子参数 `&Arc<ComponentContainer>`、`AppContext::container()`）都处于查询安全窗口内——**收到引用即可放心查询，无需额外判断窗口**；需要自行判断窗口的只有无框架时机保证的全局快照入口（`app_container()` 开区间）。
 
 ### 1. UB 面与防线
 
-**面 A：窗口外并发读写（契约保证）**——快照写侧（装配期写入、销毁期清空）与读侧（任意线程读取）并发执行、无 happens-before，构成数据竞争。违规路径：
+**面 A：窗口外并发读写（运行时拒绝 + 契约兜底）**——快照写侧（装配期写入、销毁期取回）与读侧（任意线程读取）的并发防护：
 
-- 装配期（`assemble` / `create` / `init`）内 spawn 线程并发读取；
-- 钩子（`after_all_ready` / `before_destroy`）内 spawn 不 await 的任务，存活至销毁期仍在读取；
-- GUI 等宿主场景将 `Application` 的 drop 放在后台任务结束之前（销毁期仍有读者）。
+**装配期（UB 面已消除）**：
+
+- 外部并发读被 poll 段守卫运行时拒绝：BUILDING 态仅装配任务自身可读（含装配任务 spawn 的同线程调度任务在内的外部执行流一律 `None`，不触数据）；写侧对 core 外不可见（`pub(crate)`）；
+- 装配任务自身读写交替：create/init 采用 temporarily remove 模式（先取出处理器所有权、释放对仓库的可变借用，await 期间回调只读查询，完成后插回）——写侧借用不跨 await，`&mut` 与 `&T` 生存期不重叠；
+- freeze 发布边界：Release-Acquire 配对——读者 load 到 READY 必然看到全部写入（要么完整读到、要么 `None`，无半成品可见）。
+
+**销毁期（各读入口的并发窗口）**：
+
+读路径共性：查询入口内部立即 `Arc` clone（借用纳秒级、不跨 await），克隆后数据由 `Arc` 计数保活；`take` 先 CAS 转移 DESTROYING 态——此后发起的新读一律 `None`。各入口的窗口均为「get 到 clone 完成之间」的瞬间：
+
+- **全局快照**（`app_container()` / `app_config()`）：get 到 clone 之间与清空的瞬间重叠是唯一窗口；克隆后的 `Arc` 保活容器/配置，清空后继续查询为空壳（内部 cell 返回 `None`，安全失败）；
+- **事件发布器**（`publish`）：克隆外层 `Arc<Vec<_>>` 后跨 await 分派——分派期间数据由 `Arc` 保活，清空仅释放发布器自身那份引用；get 到 clone 之间与清空的瞬间重叠是唯一窗口；
+- **组件容器查询**（`get_component` 系列）：各层 cell 的 get 到 clone 之间与 take 的瞬间重叠是唯一窗口；克隆后的 `Arc<T>` 实例保活，销毁经 `try_unwrap` 计数校验报错而非 UB。
+
+**窗口的触发前提与概率定性**：
+
+- 该窗口仅当读者违反生命周期约束（钩子内 spawn 不 await 的任务 / 自建线程，未收编）时才可能被触达——合法读者全部为框架托管任务，运行期结束时已 cancel + await 收编，take 时无读者；
+- 即使违反约束，容器查询是短暂过程（查询入口内部立即 `Arc` clone，借用纳秒级），与 take 窗口重叠是小概率事件。
 
 **面 B：用户 unsafe 代码撒谎**——`unsafe impl Send/Sync`（非线程安全类型跨线程）、unsafe 延长引用生命周期（自制 `&'static` 悬垂）、unsafe 裸指针。框架无法防护，属 Rust unsafe 的根本边界。
 
-框架侧防线：快照写侧对 core 外不可见（`pub(crate)`），只读入口返回 `Arc` clone；safe 路径全部安全失败（返回 `None` / 报错暴露 / panic fail-fast），不会 UB。
+框架侧防线：快照写侧对 core 外不可见（`pub(crate)`）；装配期读经 poll 段守卫、销毁期新读经 DESTROYING 态运行时拒绝；只读入口返回 `Arc` clone；safe 路径安全失败（返回 `None` / 报错暴露 / panic fail-fast）；销毁期窗口靠收编契约消除（违规触达为小概率事件，见上文）。
 
 ### 2. 生命周期时序
 
 ```text
 配置加载 + 配置快照安装（app_config 窗口开启）
 assemble（插件扩展参数）
-  → create + init（装配期：单任务串行、固定调用线程，无并发任务触碰装配数据）
+  → create + init（装配期：单任务串行、固定调用线程；写侧借用经 temporarily remove 不跨 await，外部并发读被 poll 段守卫拒绝）
   → 容器冻结（容器查询安全窗口开启：仓库全部只读）
   → after_all_ready 批次（钩子参数访问容器，无全局快照）
   → 容器快照安装（app_container 窗口开启）
   ─────────── 运行期（容器查询安全窗口：多线程并发只读，零锁）───────────
   → 容器快照清空（app_container 窗口关闭）
   → before_destroy 批次（钩子参数访问容器）
+  → 缓存/索引清空（take 先 CAS 转移 DESTROYING 态，此后新读一律 None）
   → 销毁循环（逆拓扑序 destroy_method，查询窗口关闭）
   → 配置快照清空（app_config 窗口关闭，关闭流程最后一步）
 ```
@@ -514,7 +530,6 @@ assemble（插件扩展参数）
 | **容器查询总窗口** | **容器冻结（`after_all_ready` 批次前）→ `before_destroy` 批次（含）**——冻结后仓库全部只读，无论经何种入口查询都安全 | 冻结前为装配期（仓库可写，不可查询）；销毁循环开始后仓库拆解 |
 | 钩子参数 `&Arc<ComponentContainer>` | 框架在 `after_all_ready` / `before_destroy` 批次主动传入，**传入即安全** | — |
 | `AppContext::container()` | 框架在 components_ready / finalize / 启动钩子 / 关闭钩子主动传入 ctx，**传入即安全** | — |
-| 字段注入 `Arc<ComponentContainer>` | create 注入后全期可用 | — |
 | 插件 `assemble` | 仅扩展参数（组件未创建，无组件 API） | 组件不可得 |
 | 插件 `shutdown_hook` | 无上下文参数；持有 `Arc` clone 则保活安全 | — |
 | `destroy_method` 内 | 可访问自身依赖（被依赖者后销毁）；依赖者不可得（销毁校验计数） | — |
@@ -524,7 +539,7 @@ assemble（插件扩展参数）
 
 边界差异说明（按访问入口分档）：
 - **容器查询总窗口**：容器冻结（`after_all_ready` 批次前）→ `before_destroy` 批次（含）。冻结后仓库全部只读，查询始终安全；冻结前为装配期（仓库可写、不可查询），销毁循环开始后仓库拆解（查询退化）。
-- **框架主动传入引用的入口无需关注窗口**：`after_all_ready` / `before_destroy` 批次的钩子参数 `&Arc<ComponentContainer>`、`AppContext::container()`（components_ready / finalize / 启动钩子 / 关闭钩子）、create 注入的 `Arc<ComponentContainer>`——框架只在这些时刻传入引用，拿到引用即处于查询安全窗口内，可放心使用。
+- **框架主动传入引用的入口无需关注窗口**：`after_all_ready` / `before_destroy` 批次的钩子参数 `&Arc<ComponentContainer>`、`AppContext::container()`（components_ready / finalize / 启动钩子 / 关闭钩子）——框架只在这些时刻传入引用，拿到引用即处于查询安全窗口内，可放心使用。
 - **仅全局快照入口需自行判断窗口**：`app_container()` 为开区间（安装在 `after_all_ready` 批次后、清空在 `before_destroy` 批次前，批次内改经钩子参数）；`app_config()` 窗口最宽（配置加载完成后 → 组件销毁完成，全生命周期）。
 - **默认事件发布器为开区间**：监听器索引的收集与清空分别发生在发布器自身的 `after_all_ready` / `before_destroy` 回调内，批次内其他组件的分派可用性依赖执行顺序，不可保证。用户自定义 `EventPublisher` 实现不受此窗口约束。
 

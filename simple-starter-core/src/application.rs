@@ -3,6 +3,7 @@ use crate::model::context::global_context::{clear_config_snapshot, install_confi
 use crate::model::context::{AppContext, TaskSpawnsFactory};
 use crate::model::job::CronJob;
 use crate::model::plugin::Plugin;
+use crate::utils::assembly_guard::AssemblyTask;
 use crate::utils::core_util::{get_config_to_struct, LogExpectExt};
 use crate::utils::inner_util::{find_cycle_path, merge_toml_values};
 use crate::{BoxFuture, ComponentProcessorFactory};
@@ -650,7 +651,10 @@ impl Application {
         let rt = self.tokio_runtime.take().unwrap();
         let app = &mut *self;
 
-        let result = rt.block_on(async move {
+        // 装配任务 poll 段守卫：装配期（组件 create/init 的 FreezeCell 读写）
+        // 仅装配任务自身可读未定型数据，外部并发读（含 spawn 的同线程任务）
+        // 被运行时拒绝（返回 None）；读闸门随 poll 段自动开关
+        let result = rt.block_on(AssemblyTask::new(async move {
             // 3. 插件 assemble（装配期：只授予扩展存储，装配扩展注册表）
             for plugin in plugins.iter_mut() {
                 let extensions = app.context.extensions_mut();
@@ -729,7 +733,7 @@ impl Application {
             }
 
             Ok(plugins)
-        });
+        }));
 
         // 把 runtime 放回去
         self.tokio_runtime = Some(rt);

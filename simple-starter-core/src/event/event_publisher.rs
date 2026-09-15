@@ -62,8 +62,11 @@ pub(crate) struct DefaultEventPublisher {
     ///
     /// 生命周期：`after_all_ready` 批次收集一次（`get_mut` 填充）→ 冻结
     /// （运行期分派零锁读）→ `before_destroy` 批次清空一次（释放全部
-    /// 监听器强引用，断开"监听器 ↔ 发布器"引用环）。
-    listeners: FreezeCell<HashMap<TypeId, Vec<Arc<dyn AnyEventListener>>>>,
+    /// 监听器强引用，断开“监听器 ↔ 发布器”引用环）。
+    /// 列表以 `Arc<Vec<_>>` 承载：`publish` 克隆外层 Arc（单次计数、零堆
+    /// 分配）后跨 await 分派——分派期间数据由 Arc 计数保活，借用不跨
+    /// await，销毁期清空与新读的并发窗口仅存在于 get 内部瞬间。
+    listeners: FreezeCell<HashMap<TypeId, Arc<Vec<Arc<dyn AnyEventListener>>>>>,
 }
 
 impl DefaultEventPublisher {
@@ -107,7 +110,7 @@ impl DefaultEventPublisher {
                     name,
                     listener.event_type_id()
                 );
-                map.entry(reg.event_type_id).or_default().push(listener);
+                Arc::make_mut(map.entry(reg.event_type_id).or_default()).push(listener);
             }
         }
         Ok(())
@@ -146,14 +149,15 @@ impl EventPublisher for DefaultEventPublisher {
         let event_type_id = Any::type_id(&*event);
 
         // 收集阶段已写入（after_all_ready 批次）；未收集时按无监听器处理。
-        // 直接借用索引内的 Arc 迭代（零克隆）：clear 仅在 before_destroy 批次
-        // 执行（销毁前框架已等待全部后台任务结束），与运行期分派无并发
+        // 克隆外层 Arc（单次计数、零堆分配）后跨 await 分派：分派期间
+        // 数据由 Arc 计数保活，借用不跨 await
         if let Some(listeners) = self
             .listeners
             .get()
             .and_then(|map| map.get(&event_type_id))
+            .cloned()
         {
-            for listener in listeners {
+            for listener in listeners.iter() {
                 // 强引用监听器：before_destroy 清空前始终存活，直接分派
                 if let Err(e) = listener.on_event_any(event.clone()).await {
                     tracing::error!(

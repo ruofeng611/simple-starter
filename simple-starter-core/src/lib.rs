@@ -43,6 +43,7 @@ mod loaders {
 
 /// 工具层（公开工具与内部工具）
 mod utils {
+    pub(crate) mod assembly_guard;
     pub(crate) mod core_util;
     pub(crate) mod freeze_cell;
     pub(crate) mod inner_util;
