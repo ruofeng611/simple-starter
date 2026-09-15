@@ -1,4 +1,5 @@
 use crate::loaders::config_loader::global_config_load;
+use crate::model::context::global_context::{clear_config_snapshot, install_config_snapshot};
 use crate::model::context::{AppContext, TaskSpawnsFactory};
 use crate::model::job::CronJob;
 use crate::model::plugin::Plugin;
@@ -272,6 +273,9 @@ impl Application {
             eprintln!("FATAL: Failed to set global config (already initialized)");
             return;
         }
+        // 配置加载完成：安装全局配置快照（此后任意阶段可经 `app_config` 读取，
+        // 窗口持续至组件销毁完成、关闭流程最后一步清空）
+        install_config_snapshot(self.context.config());
 
         // 2. 初始化 Tracing 日志系统
         if let Err(e) = self.init_tracing() {
@@ -670,8 +674,7 @@ impl Application {
             if has_inventory_components {
                 let config = app
                     .context
-                    .config()
-                    .clone();
+                    .config();
                 if let Err(e) = app.context.container().load(config).await {
                     return Err(anyhow!("Component repository load failed: {:?}", e));
                 }
@@ -790,6 +793,10 @@ impl Application {
                         error!("Failed to destroy components: {:?}", e);
                     }
                 }
+
+                // 组件销毁完成：清空全局配置快照（关闭流程最后一步，此后
+                // `app_config` 返回 None；此前已持有 Arc clone 者保活可继续使用）
+                clear_config_snapshot();
 
                 info!("Application shutdown completed. Bye!");
             });

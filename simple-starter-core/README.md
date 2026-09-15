@@ -121,7 +121,7 @@ fn main() {
 
 #### 全局上下文快照（无上下文传播场景的读取点）
 
-`app_container()` / `app_config()` 以全局静态快照镜像 `AppContext` 的组件容器与全局配置（`Arc` clone，不转移所有权），供**无上下文传播的场景**读取：用户自建后台线程、无法注入的工具函数等。典型用法是路由宏的 `state` 表达式（路由构建发生在插件 finalize 期，晚于快照安装）：
+`app_container()` / `app_config()` 以全局静态快照镜像 `AppContext` 的组件容器与全局配置（安装与读取均为 `Arc` clone，不转移所有权），供**无上下文传播的场景**读取：用户自建后台线程、无法注入的工具函数等。典型用法是路由宏的 `state` 表达式（路由构建发生在插件 finalize 期，晚于容器快照安装）：
 
 ```rust
 #[get(
@@ -133,9 +133,9 @@ fn main() {
 )]
 ```
 
-- **安装**：全部组件创建与初始化完成、容器冻结之后（`after_all_ready` 批次前）写入并冻结——此后任意线程零锁读
-- **清空**：销毁前批次（`before_destroy`）执行完毕、销毁循环开始之前清空——此后读取返回 `None`
-- **合法窗口**：仅在 `after_all_ready` 与 `before_destroy` 之间（运行期）可读，窗口外返回 `None`
+- **安装**：两个快照独立安装——配置快照在配置加载完成后（`Application::run` 起始），组件容器快照在 `after_all_ready` 批次后（批次内回调经钩子参数访问容器，不依赖全局快照）
+- **清空**：组件容器快照在 `before_destroy` 批次前清空（批次内同理用钩子参数）；配置快照在组件销毁完成后、关闭流程最后一步清空
+- **合法窗口**：`app_container` 仅运行期可读（`after_all_ready` 批次后至 `before_destroy` 批次前），窗口外返回 `None`；`app_config` 自配置加载完成至组件销毁完成全程可读。窗口外读取返回 `None`；已持有 `Arc` clone 的读者访问到的是已掏空的空壳（查询安全失败，不会悬垂）
 - **单实例约束**：静态槽位进程内全局唯一，同一进程先后启动多个 `Application` 时第二次安装 panic（fail-fast）
 - **定位**：这是依赖注入之外的逃生舱，不是注入机制的替代——能通过字段注入 / 钩子参数拿到上下文的代码应优先使用注入
 
@@ -465,3 +465,61 @@ graph TD
     style S_Components fill:#fff3e0,stroke:#e65100
     style S_Shutdown fill:#ffebee,stroke:#b71c1c
 ```
+
+## 六、并发安全与使用周期（UB 约束）
+
+框架以无锁快照（`FreezeCell`）实现零锁读：写操作收敛到装配/销毁窗口（单线程），读操作收敛到运行期窗口（多线程只读）。以下内容约束两类未定义行为（UB）并给出各使用方的安全周期。
+
+### 1. UB 面与防线
+
+**面 A：窗口外并发读写（契约保证）**——快照写侧（装配期写入、销毁期清空）与读侧（任意线程读取）并发执行、无 happens-before，构成数据竞争。违规路径：
+
+- 装配期（`assemble` / `create` / `init`）内 spawn 线程并发读取；
+- 钩子（`after_all_ready` / `before_destroy`）内 spawn 不 await 的任务，存活至销毁期仍在读取；
+- GUI 等宿主场景将 `Application` 的 drop 放在后台任务结束之前（销毁期仍有读者）。
+
+**面 B：用户 unsafe 代码撒谎**——`unsafe impl Send/Sync`（非线程安全类型跨线程）、unsafe 延长引用生命周期（自制 `&'static` 悬垂）、unsafe 裸指针。框架无法防护，属 Rust unsafe 的根本边界。
+
+框架侧防线：快照写侧对 core 外不可见（`pub(crate)`），只读入口返回 `Arc` clone；safe 路径全部安全失败（返回 `None` / 报错暴露 / panic fail-fast），不会 UB。
+
+### 2. 生命周期时序
+
+```text
+配置加载 + 配置快照安装（app_config 窗口开启）
+assemble（插件扩展参数）
+  → create + init（单线程装配，宏生成代码读写交替、互不重叠）
+  → 容器冻结
+  → after_all_ready 批次（钩子参数访问容器，无全局快照）
+  → 容器快照安装（app_container 窗口开启）
+  ───────────── 运行期（多线程只读，零锁）─────────────
+  → 容器快照清空（app_container 窗口关闭）
+  → before_destroy 批次（钩子参数访问容器）
+  → 销毁循环（逆拓扑序 destroy_method）
+  → 配置快照清空（app_config 窗口关闭，关闭流程最后一步）
+```
+
+### 3. 安全使用周期
+
+| 使用方 | 安全窗口 | 窗口外行为 |
+|---|---|---|
+| 插件 `assemble` | 仅扩展参数（组件未创建，无组件 API） | 组件不可得 |
+| 插件 `components_ready` / `finalize` | 组件全部就绪后 | — |
+| 插件 `shutdown_hook` | 无上下文参数；持有 `Arc` clone 则保活安全 | — |
+| 启动钩子 / 关闭钩子 | 组件全就绪 / 组件未销毁 | — |
+| 组件（一般 bean） | **`after_all_ready` 批次（含）→ `before_destroy` 批次（含）**（经钩子参数/注入访问） | 窗口外读取返回 `None` / 报错 |
+| `destroy_method` 内 | 可访问自身依赖（被依赖者后销毁）；依赖者不可得（销毁校验计数） | — |
+| 全局快照 `app_container` | **`after_all_ready` 批次（不含）→ `before_destroy` 批次（不含）** | 批次内与窗口外返回 `None`（批次内经钩子参数） |
+| 全局快照 `app_config` | **配置加载完成后 → 组件销毁完成**（关闭流程最后一步清空） | 窗口外返回 `None`；已持有 `Arc` clone 者保活 |
+| 默认事件发布器 | **`after_all_ready` 批次（不含）→ `before_destroy` 批次（不含）** | 批次内分派依执行顺序（可能未收集/已清空） |
+
+边界差异说明：组件注入访问的窗口为闭区间——容器冻结发生在 `after_all_ready` 批次前，组件存活至销毁循环；**`app_container` 全局快照的窗口为开区间**——批次内回调经钩子参数 `&Arc<ComponentContainer>` 访问容器，快照安装在批次后、清空在批次前（同一参数也覆盖 `before_destroy` 批次）。**`app_config` 的窗口最宽**：配置加载完成后即可读（早于组件装配），持续至组件销毁完成（关闭流程最后一步），覆盖全生命周期。**默认事件发布器的窗口同为开区间**——监听器索引的收集与清空分别发生在发布器自身的 `after_all_ready` 与 `before_destroy` 回调内，批次内其他组件的分派可用性依赖执行顺序，不可保证。用户自定义 `EventPublisher` 实现不受此窗口约束。
+
+### 4. 非 UB 兜底（safe 路径全部安全失败）
+
+| 场景 | 结局 |
+|---|---|
+| 持组件实例 `Arc` clone 至销毁后 | 销毁时计数校验失败 → **报错暴露** |
+| 持容器/配置 `Arc` clone 至销毁后 | 访问空壳 → 查询安全失败 |
+| 销毁后顺序读快照 | 返回 `None` |
+| 同一进程二次启动 `Application` | 快照安装 panic（fail-fast） |
+| `freeze` 后调用 `get_mut` / TypeId 下转失败 | 返回 `None` |
