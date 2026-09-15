@@ -135,7 +135,7 @@ fn main() {
 
 - **安装**：两个快照独立安装——配置快照在配置加载完成后（`Application::run` 起始），组件容器快照在 `after_all_ready` 批次后（批次内回调经钩子参数访问容器，不依赖全局快照）
 - **清空**：组件容器快照在 `before_destroy` 批次前清空（批次内同理用钩子参数）；配置快照在组件销毁完成后、关闭流程最后一步清空
-- **合法窗口**：`app_container` 仅运行期可读（`after_all_ready` 批次后至 `before_destroy` 批次前），窗口外返回 `None`；`app_config` 自配置加载完成至组件销毁完成全程可读。窗口外读取返回 `None`；已持有 `Arc` clone 的读者访问到的是已掏空的空壳（查询安全失败，不会悬垂）
+- **合法窗口**：`app_container` 仅运行期可读（`after_all_ready` 批次后至 `before_destroy` 批次前），窗口外返回 `None`；`app_config` 自配置加载完成至组件销毁完成全程可读。窗口外读取返回 `None`；已持有 `Arc` clone 的读者访问到的是已掏空的空壳（查询安全失败，不会悬垂）。注意：快照窗口只约束快照入口本身——容器查询安全窗口更宽（容器冻结起即安全，见第六节），框架主动传入容器引用的时机（钩子参数、`AppContext::container()`）不受快照窗口限制
 - **单实例约束**：静态槽位进程内全局唯一，同一进程先后启动多个 `Application` 时第二次安装 panic（fail-fast）
 - **定位**：这是依赖注入之外的逃生舱，不是注入机制的替代——能通过字段注入 / 钩子参数拿到上下文的代码应优先使用注入
 
@@ -396,7 +396,8 @@ graph TD
         CheckProfile -- 是 --> LoadProfile["加载 application-{profile}.toml"]
         LoadProfile --> MergeConfig["合并配置: 默认 + 基础 + Profile"]
         CheckProfile -- 否 --> MergeConfig
-        MergeConfig --> InitTracing[初始化 Tracing 日志系统]
+        MergeConfig --> InstallConfigSnapshot["安装配置快照 app_config"]
+        InstallConfigSnapshot --> InitTracing[初始化 Tracing 日志系统]
         InitTracing --> SetupLayers[设置日志层 & 文件守卫]
     end
 
@@ -421,17 +422,18 @@ graph TD
             CompCond --> CompTopo[计算依赖拓扑顺序]
             CompTopo --> CompCycle{检测到循环依赖?}
             CompCycle -- 是 --> Error[返回错误]
-            CompCycle -- 否 --> CompCreate["循环: processor.create()"]
-            CompCreate --> CompInit["循环: processor.init()"]
+            CompCycle -- 否 --> CompCreate["循环: create + init（创建后立即初始化）"]
+            CompCreate --> AfterAllReady["容器冻结（查询窗口开启）+ after_all_ready 批次"]
         end
 
         CheckComps -- 否 --> PluginCompReady
-        CompInit --> PluginCompReady["循环: plugin.components_ready() 组件就绪期"]
+        AfterAllReady --> InstallContainerSnapshot["安装容器快照 app_container"]
+        InstallContainerSnapshot --> PluginCompReady["循环: plugin.components_ready() 组件就绪期"]
         PluginCompReady --> PluginFinalize["循环: plugin.finalize() 收尾期"]
         PluginFinalize --> StartHooks[执行启动钩子 Startup Hooks]
     end
 
-    subgraph S_Execution ["4. 主运行循环"]
+    subgraph S_Execution ["4. 主运行循环（容器查询安全窗口）"]
         StartHooks --> CheckMainLoop{是否有自定义主循环?}
         CheckMainLoop -- "是 (如 GUI)" --> SpawnCore["后台派发 App 核心管理任务"]
         SpawnCore --> UserLoop[执行用户自定义主循环钩子]
@@ -454,8 +456,11 @@ graph TD
         CancelToken --> WaitCore[等待核心任务结束]
         WaitCore --> DownHooks[执行关闭钩子 Shutdown Hooks]
         DownHooks --> PluginDown["插件关闭 (逆序)"]
-        PluginDown --> CompDown["组件销毁 (逆序)"]
-        CompDown --> End([程序退出])
+        PluginDown --> ClearContainerSnapshot["清空容器快照 app_container"]
+        ClearContainerSnapshot --> BeforeDestroy["容器级 before_destroy 批次"]
+        BeforeDestroy --> CompDown["组件销毁 (逆序)"]
+        CompDown --> ClearConfigSnapshot["清空配置快照 app_config（最后一步）"]
+        ClearConfigSnapshot --> End([程序退出])
     end
 
     style Start fill:#f9f,stroke:#333,stroke-width:2px
@@ -468,7 +473,11 @@ graph TD
 
 ## 六、并发安全与使用周期（UB 约束）
 
-框架以无锁快照（`FreezeCell`）实现零锁读：写操作收敛到装配/销毁窗口（单线程），读操作收敛到运行期窗口（多线程只读）。以下内容约束两类未定义行为（UB）并给出各使用方的安全周期。
+框架以无锁快照（`FreezeCell`）实现零锁读：写操作收敛到装配/销毁窗口（**单任务串行**——启动/销毁流程是一个 `block_on` 顶层 future，固定于调用线程执行、不被工作窃取；即使将来跨线程迁移，同一任务内 await 前后的操作有 happens-before，仍无竞争），读操作收敛到容器冻结后的查询安全窗口（多线程并发只读）。以下内容约束两类未定义行为（UB）并给出各使用方的安全周期。
+
+> **安全窗口的定位**：本节安全窗口指的是**通过容器获取组件**（查询）的窗口，**不是组件实例本身的安全访问窗口**——实例经 `Arc` 保活：一旦拿到 `Arc<T>`，实例数据只读访问不受窗口限制（持有者随时可读）；销毁期对仍被持有的实例，框架以计数校验报错兑底而非释放，实例访问始终安全（代价是报错/泄漏，而非 UB）。
+>
+> **入口分档**：框架主动传入容器引用的时机（钩子参数 `&Arc<ComponentContainer>`、`AppContext::container()`、字段注入）都处于查询安全窗口内——**收到引用即可放心查询，无需额外判断窗口**；需要自行判断窗口的只有无框架时机保证的全局快照入口（`app_container()` 开区间）。
 
 ### 1. UB 面与防线
 
@@ -487,32 +496,37 @@ graph TD
 ```text
 配置加载 + 配置快照安装（app_config 窗口开启）
 assemble（插件扩展参数）
-  → create + init（单线程装配，宏生成代码读写交替、互不重叠）
-  → 容器冻结
+  → create + init（装配期：单任务串行、固定调用线程，无并发任务触碰装配数据）
+  → 容器冻结（容器查询安全窗口开启：仓库全部只读）
   → after_all_ready 批次（钩子参数访问容器，无全局快照）
   → 容器快照安装（app_container 窗口开启）
-  ───────────── 运行期（多线程只读，零锁）─────────────
+  ─────────── 运行期（容器查询安全窗口：多线程并发只读，零锁）───────────
   → 容器快照清空（app_container 窗口关闭）
   → before_destroy 批次（钩子参数访问容器）
-  → 销毁循环（逆拓扑序 destroy_method）
+  → 销毁循环（逆拓扑序 destroy_method，查询窗口关闭）
   → 配置快照清空（app_config 窗口关闭，关闭流程最后一步）
 ```
 
 ### 3. 安全使用周期
 
-| 使用方 | 安全窗口 | 窗口外行为 |
+| 使用方 / 访问入口 | 安全窗口（容器查询） | 窗口外行为 |
 |---|---|---|
+| **容器查询总窗口** | **容器冻结（`after_all_ready` 批次前）→ `before_destroy` 批次（含）**——冻结后仓库全部只读，无论经何种入口查询都安全 | 冻结前为装配期（仓库可写，不可查询）；销毁循环开始后仓库拆解 |
+| 钩子参数 `&Arc<ComponentContainer>` | 框架在 `after_all_ready` / `before_destroy` 批次主动传入，**传入即安全** | — |
+| `AppContext::container()` | 框架在 components_ready / finalize / 启动钩子 / 关闭钩子主动传入 ctx，**传入即安全** | — |
+| 字段注入 `Arc<ComponentContainer>` | create 注入后全期可用 | — |
 | 插件 `assemble` | 仅扩展参数（组件未创建，无组件 API） | 组件不可得 |
-| 插件 `components_ready` / `finalize` | 组件全部就绪后 | — |
 | 插件 `shutdown_hook` | 无上下文参数；持有 `Arc` clone 则保活安全 | — |
-| 启动钩子 / 关闭钩子 | 组件全就绪 / 组件未销毁 | — |
-| 组件（一般 bean） | **`after_all_ready` 批次（含）→ `before_destroy` 批次（含）**（经钩子参数/注入访问） | 窗口外读取返回 `None` / 报错 |
 | `destroy_method` 内 | 可访问自身依赖（被依赖者后销毁）；依赖者不可得（销毁校验计数） | — |
-| 全局快照 `app_container` | **`after_all_ready` 批次（不含）→ `before_destroy` 批次（不含）** | 批次内与窗口外返回 `None`（批次内经钩子参数） |
-| 全局快照 `app_config` | **配置加载完成后 → 组件销毁完成**（关闭流程最后一步清空） | 窗口外返回 `None`；已持有 `Arc` clone 者保活 |
+| 全局快照 `app_container()` | **`after_all_ready` 批次（不含）→ `before_destroy` 批次（不含）**——唯一需自行判断窗口的入口 | 返回 `None`（批次内经钩子参数） |
+| 全局快照 `app_config()` | **配置加载完成后 → 组件销毁完成**（关闭流程最后一步清空） | 返回 `None`；已持有 `Arc` clone 者保活 |
 | 默认事件发布器 | **`after_all_ready` 批次（不含）→ `before_destroy` 批次（不含）** | 批次内分派依执行顺序（可能未收集/已清空） |
 
-边界差异说明：组件注入访问的窗口为闭区间——容器冻结发生在 `after_all_ready` 批次前，组件存活至销毁循环；**`app_container` 全局快照的窗口为开区间**——批次内回调经钩子参数 `&Arc<ComponentContainer>` 访问容器，快照安装在批次后、清空在批次前（同一参数也覆盖 `before_destroy` 批次）。**`app_config` 的窗口最宽**：配置加载完成后即可读（早于组件装配），持续至组件销毁完成（关闭流程最后一步），覆盖全生命周期。**默认事件发布器的窗口同为开区间**——监听器索引的收集与清空分别发生在发布器自身的 `after_all_ready` 与 `before_destroy` 回调内，批次内其他组件的分派可用性依赖执行顺序，不可保证。用户自定义 `EventPublisher` 实现不受此窗口约束。
+边界差异说明（按访问入口分档）：
+- **容器查询总窗口**：容器冻结（`after_all_ready` 批次前）→ `before_destroy` 批次（含）。冻结后仓库全部只读，查询始终安全；冻结前为装配期（仓库可写、不可查询），销毁循环开始后仓库拆解（查询退化）。
+- **框架主动传入引用的入口无需关注窗口**：`after_all_ready` / `before_destroy` 批次的钩子参数 `&Arc<ComponentContainer>`、`AppContext::container()`（components_ready / finalize / 启动钩子 / 关闭钩子）、create 注入的 `Arc<ComponentContainer>`——框架只在这些时刻传入引用，拿到引用即处于查询安全窗口内，可放心使用。
+- **仅全局快照入口需自行判断窗口**：`app_container()` 为开区间（安装在 `after_all_ready` 批次后、清空在 `before_destroy` 批次前，批次内改经钩子参数）；`app_config()` 窗口最宽（配置加载完成后 → 组件销毁完成，全生命周期）。
+- **默认事件发布器为开区间**：监听器索引的收集与清空分别发生在发布器自身的 `after_all_ready` / `before_destroy` 回调内，批次内其他组件的分派可用性依赖执行顺序，不可保证。用户自定义 `EventPublisher` 实现不受此窗口约束。
 
 ### 4. 非 UB 兜底（safe 路径全部安全失败）
 
