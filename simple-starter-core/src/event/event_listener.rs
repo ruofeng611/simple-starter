@@ -1,6 +1,5 @@
 //! 事件监听器：泛型监听 trait + 内部统一分派 trait + 类型桥接适配器。
 
-use crate::model::component::Injectable;
 use crate::event::app_event::AppEvent;
 use crate::BoxFuture;
 use async_trait::async_trait;
@@ -11,9 +10,8 @@ use std::sync::Arc;
 ///
 /// 实现此 trait 的组件配合 `#[event_listener]` 宏注册后，
 /// 发布器在容器就绪批次（`after_all_ready`）自动收集（无需手动注册）。
-/// 必须显式继承 `Injectable`（框架约束：可注入 trait 的 super_trait）。
 #[async_trait]
-pub trait EventListener<E: AppEvent>: Injectable {
+pub trait EventListener<E: AppEvent>: Any + Send + Sync {
     /// 处理事件。
     async fn on_event(&self, event: &E) -> anyhow::Result<()>;
 }
@@ -23,7 +21,7 @@ pub trait EventListener<E: AppEvent>: Injectable {
 /// 发布器以 `Arc<dyn AnyEventListener>` 统一存储全部监听器，
 /// 按事件类型 `TypeId` 分桶后在分派时还原为具体事件。
 #[async_trait]
-pub trait AnyEventListener: Injectable {
+pub trait AnyEventListener: Any + Send + Sync {
     /// 返回所监听事件的具体类型（发布器分桶索引键）。
     fn event_type_id(&self) -> TypeId;
 

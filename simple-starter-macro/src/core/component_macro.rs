@@ -1,7 +1,6 @@
 use crate::utils::macro_build_util::{
     get_arc_inner_type, get_dyn_trait_in_arc, get_dyn_trait_in_vec_arc,
-    is_arc_dyn_trait, is_vec_arc_dyn_trait, parse_and_strip_inject,
-    parse_and_strip_inject_primary, trait_object_to_type,
+    is_arc_dyn_trait, is_vec_arc_dyn_trait, parse_and_strip_inject, trait_object_to_type,
 };
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -50,30 +49,13 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
     let mut dependencies_names = Vec::new();
     let mut trait_dependency_type_ids: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut type_dependency_type_ids: Vec<proc_macro2::TokenStream> = Vec::new();
-    let mut primary_dependency_type_ids: Vec<proc_macro2::TokenStream> = Vec::new();
     let mut is_unit_struct = false;
 
     if let Data::Struct(ref mut data) = ast.data {
         if let syn::Fields::Named(fields) = &mut data.fields {
             for field in fields.named.iter_mut() {
                 let (is_injected, inject_name) = parse_and_strip_inject(&mut field.attrs);
-                let is_primary = parse_and_strip_inject_primary(&mut field.attrs);
                 let field_ident = field.ident.as_ref().unwrap();
-
-                // #[inject_primary] 单独使用即隐含注入语义；与 #[inject] 互斥
-                if is_primary && is_injected {
-                    return syn::Error::new(
-                        field_ident.span(),
-                        format!(
-                            "#[inject_primary] cannot be combined with #[inject] on field '{}'",
-                            field_ident
-                        ),
-                    )
-                    .to_compile_error()
-                    .into();
-                }
-
-                let is_injected = is_injected || is_primary;
 
                 if !is_injected {
                     field_injections.push(quote! { #field_ident: Default::default() });
@@ -81,45 +63,19 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
                 }
 
                 // ── 分支：根据字段类型选择注入策略 ──
-                if is_primary {
-                    // primary 注入：仅允许具体类型 Arc<T>（primary 按具体类型维度注册，
-                    // 具体类型的 TypeId 才能命中 PRIMARY_BY_TYPE）
-                    if is_vec_arc_dyn_trait(&field.ty) || is_arc_dyn_trait(&field.ty) {
+                if is_vec_arc_dyn_trait(&field.ty) {
+                    // Vec<Arc<dyn Trait>> → 收集所有实现，无法按名收窄
+                    if inject_name.is_some() {
                         return syn::Error::new(
                             field.ty.span(),
                             format!(
-                                "#[inject_primary] on field '{}' requires a concrete type `Arc<T>`; trait types are not supported (primary is registered on the concrete type dimension)",
+                                "#[inject(name = ...)] is not supported on field '{}': Vec<Arc<dyn Trait>> collects all implementations and cannot be narrowed by name",
                                 field_ident
                             ),
                         )
                         .to_compile_error()
                         .into();
                     }
-
-                    let inner_type = match get_arc_inner_type(&field.ty) {
-                        Some(ty) => ty,
-                        None => {
-                            return syn::Error::new(
-                                field.ty.span(),
-                                format!(
-                                    "Field '{}' marked with #[inject_primary] must be of type Arc<T>",
-                                    field_ident
-                                ),
-                            )
-                            .to_compile_error()
-                            .into();
-                        }
-                    };
-
-                    primary_dependency_type_ids.push(quote! { ::std::any::TypeId::of::<#inner_type>() });
-                    field_injections.push(quote! {
-                        #field_ident: container.get_primary_component::<#inner_type>()?
-                    });
-                    continue;
-                }
-
-                if is_vec_arc_dyn_trait(&field.ty) {
-                    // Vec<Arc<dyn Trait>> → 收集所有实现
                     let trait_obj = get_dyn_trait_in_vec_arc(&field.ty).unwrap();
                     let trait_type = trait_object_to_type(trait_obj);
                     // 生成 TypeId 表达式（const fn，static 初始化中直接求值）。trait_type 已是 Type::TraitObject，无需再加 dyn 前缀
@@ -263,7 +219,6 @@ fn component_on_struct(args: TokenStream, input: TokenStream) -> TokenStream {
                 dependencies: &[#(#dependencies_names),*],
                 trait_dependencies: &[#(#trait_dependency_type_ids),*],
                 type_dependencies: &[#(#type_dependency_type_ids),*],
-                primary_dependencies: &[#(#primary_dependency_type_ids),*],
                 name: #final_component_name,
                 condition: #condition_impl,
                 constructor: || {

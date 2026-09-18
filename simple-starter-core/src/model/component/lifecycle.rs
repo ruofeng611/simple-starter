@@ -6,7 +6,7 @@
 //! [`ComponentLifecycle`]，由装配流程（见 [`loader`](super::loader)）在
 //! 对应时机批次执行。
 
-use super::{ComponentContainer, Injectable};
+use super::ComponentContainer;
 use async_trait::async_trait;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// 生命周期约束，避免破坏销毁阶段的引用计数检查）。
 /// 实现本 trait 的 impl 块须标注 `#[lifecycle]` 属性宏以生成 inventory 注册。
 #[async_trait]
-pub trait ComponentLifecycle: Injectable {
+pub trait ComponentLifecycle: Any + Send + Sync {
     /// 全部 bean 完成注入与初始化后执行（按创建顺序正序批次）
     async fn after_all_ready(&self, _container: &Arc<ComponentContainer>) -> anyhow::Result<()> {
         Ok(())

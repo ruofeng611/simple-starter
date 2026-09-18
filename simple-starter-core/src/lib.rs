@@ -80,8 +80,7 @@ pub use tracing; // 用于日志记录 (info!, error!, debug! 等)
 
 // 2. 核心宏重导出（依赖方无需直接依赖 simple-starter-macro）
 pub use simple_starter_macro::{
-    component, configuration, cron_job, event_listener, inject, injectable, lifecycle, primary,
-    provider,
+    component, configuration, cron_job, event_listener, inject, injectable, lifecycle, provider,
 };
 
 // 3. 核心入口与工具

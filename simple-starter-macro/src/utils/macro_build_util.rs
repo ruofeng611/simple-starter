@@ -113,34 +113,6 @@ pub(crate) fn parse_and_strip_inject(attrs: &mut Vec<Attribute>) -> (bool, Optio
     (is_injected, inject_name)
 }
 
-/// 解析并移除字段或参数上的 `#[inject_primary]` 属性。
-///
-/// # 语义
-/// 标记该字段/参数按 primary（首要实例）获取，仅适用于 `Arc<ConcreteType>`
-/// 具体类型（trait 类型由调用方宏在解析类型后编译报错）。
-/// 与 `#[inject]` 互斥，单独使用即隐含注入语义。
-///
-/// # 返回值
-/// - `bool`: 是否存在 `#[inject_primary]` 属性。
-pub(crate) fn parse_and_strip_inject_primary(attrs: &mut Vec<Attribute>) -> bool {
-    let mut is_primary = false;
-    let mut indices_to_remove = Vec::new();
-
-    for (i, attr) in attrs.iter().enumerate() {
-        if attr.path().is_ident("inject_primary") {
-            is_primary = true;
-            indices_to_remove.push(i);
-        }
-    }
-
-    // 倒序移除，防止索引偏移
-    for i in indices_to_remove.into_iter().rev() {
-        attrs.remove(i);
-    }
-
-    is_primary
-}
-
 /// 组合基础路径和方法路径。
 ///
 /// 用于 `rest_controller` 和 `security_controller` 宏中拼接完整路由路径。

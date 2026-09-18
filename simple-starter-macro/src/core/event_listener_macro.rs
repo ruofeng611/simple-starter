@@ -5,13 +5,12 @@ use syn::{GenericArgument, ItemImpl, PathArguments};
 
 /// 处理 `#[event_listener]` 作用于 `impl EventListener<E> for Type` 块。
 ///
-/// 同时生成两个 inventory 注册：
+/// 生成 `EventListenerRegistration` 注册：事件类型 ↔ 实现组件的监听器映射，
+/// 发布器在容器就绪批次（`after_all_ready`）遍历收集构建事件类型索引。
 ///
-/// 1. `TraitImplRegistration`：`impl EventListener<E> for Type` 的 trait 实现映射，
-///    复用 trait 注入机制（`#[inject] Vec<Arc<dyn EventListener<E>>>` 可正常注入），
-///    组件 create 后 `populate_trait_obj_cache` 填充 `TRAIT_OBJ_CACHE`；
-/// 2. `EventListenerRegistration`：事件类型 ↔ 实现组件的监听器注册，
-///    发布器在容器就绪批次（`after_all_ready`）遍历收集构建事件类型索引。
+/// adapter 从组件的类型擦除实例（`Arc<dyn Any + Send + Sync>`）经
+/// safe downcast + 正向 coercion 还原为 `Arc<dyn AnyEventListener>`，
+/// 不依赖 vtable 布局假设。
 pub(crate) fn event_listener_on_impl(
     _args: TokenStream,
     item_impl: ItemImpl,
@@ -34,51 +33,16 @@ pub(crate) fn event_listener_on_impl(
         path: trait_path.clone(),
     });
 
-    // 注册 1：trait 实现映射（与 #[injectable] 生成同款，先 coerce 到完整 trait vtable 再上转 Injectable）
-    let trait_registration = quote! {
-        ::simple_starter_core::submit! {
-            ::simple_starter_core::TraitImplRegistration {
-                trait_type_id: ::std::any::TypeId::of::<dyn #trait_type>(),
-                impl_type_id: ::std::any::TypeId::of::<#impl_type>(),
-                accessor: |arc_any: ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>|
-                    -> ::std::option::Option<::simple_starter_core::TraitObjectEntry>
-                {
-                    let arc: ::std::sync::Arc<#impl_type> = arc_any.downcast::<#impl_type>().ok()?;
-                    // 先 coerce 到 dyn EventListener<E>（完整 vtable）
-                    let arc_trait: ::std::sync::Arc<dyn #trait_type> = arc;
-                    // 拆出 coercion 生成的 dyn EventListener<E> 真实 vtable（'static 只读静态数据），
-                    // 取用侧按该 vtable 拼回 fat pointer，不依赖 vtable 布局假设。
-                    let vtable = {
-                        let raw = ::std::sync::Arc::into_raw(arc_trait.clone());
-                        // SAFETY: fat pointer 位拆解（data + vtable 两段 usize），仅观察用途
-                        let bits: [usize; 2] = unsafe { ::std::mem::transmute_copy(&raw) };
-                        // SAFETY: 与 `Arc::into_raw` 配对收回，计数复原
-                        let _ = unsafe { ::std::sync::Arc::from_raw(raw) };
-                        bits[1] as *const ()
-                    };
-                    ::std::option::Option::Some(::simple_starter_core::TraitObjectEntry {
-                        obj: arc_trait as ::std::sync::Arc<dyn ::simple_starter_core::Injectable>,
-                        vtable,
-                    })
-                },
-            }
-        }
-    };
-
-    // 注册 2：事件监听器注册（发布器 init 收集用）
+    // 事件监听器注册（发布器 init 收集用）
     let listener_registration = quote! {
         ::simple_starter_core::submit! {
             ::simple_starter_core::EventListenerRegistration {
                 event_type_id: ::std::any::TypeId::of::<#event_type>(),
-                listener_trait_type_id: ::std::any::TypeId::of::<dyn #trait_type>(),
                 impl_type_id: ::std::any::TypeId::of::<#impl_type>(),
-                adapter: |arc_injectable: ::std::sync::Arc<dyn ::simple_starter_core::Injectable>|
+                adapter: |arc_any: ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>|
                     -> ::std::option::Option<::std::sync::Arc<dyn ::simple_starter_core::AnyEventListener>>
                 {
                     // 还原链路全程 safe，不依赖 vtable 布局假设：
-                    // 正向 upcast Injectable → Any（编译器生成 super_trait 槽偏移）
-                    let arc_any: ::std::sync::Arc<dyn ::std::any::Any + Send + Sync> =
-                        arc_injectable as ::std::sync::Arc<dyn ::std::any::Any + Send + Sync>;
                     // safe downcast Any → 具体实现类型（按 Any vtable 的 type_id 槽比对）
                     let arc_impl: ::std::sync::Arc<#impl_type> =
                         arc_any.downcast::<#impl_type>().ok()?;
@@ -94,7 +58,6 @@ pub(crate) fn event_listener_on_impl(
 
     let output = quote! {
         #item_impl
-        #trait_registration
         #listener_registration
     };
 

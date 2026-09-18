@@ -1,6 +1,6 @@
 # simple-starter-macro
 
-`simple-starter-macro` 提供 simple-starter 框架的全部**过程宏**，负责将声明式注解展开为组件注册、依赖注入、路由挂载、安全资源收集等底层代码。
+`simple-starter-macro` 提供 simple-starter 框架的全部**过程宏**，负责将声明式注解展开为组件注册、依赖注入、生命周期回调注册、路由挂载、安全资源收集等底层代码。
 
 > **注意**：本 crate 是纯过程宏 crate，用户**无需直接依赖**它——核心宏由 `simple-starter-core` 重导出，Web 宏由 `simple-starter-web` 重导出，安全宏由 `simple-starter-security` 重导出。仅在编写插件模块（需要同时使用三个模块的宏）时可能需要直接依赖。
 
@@ -26,7 +26,6 @@ struct UserService { /* ... */ }
         dependencies: &[],
         trait_dependencies: &[],
         type_dependencies: &[],
-        primary_dependencies: &[],
         name: "userService",
         condition: None,
         constructor: || {
@@ -88,7 +87,14 @@ impl DatabaseComponent {
 
 #### 2. `#[provider]` —— 函数工厂
 
-把函数注册为组件工厂，适用于第三方库类型或需要复杂初始化的对象。函数参数自动按类型注入（规则同 `#[inject]`）；返回类型（自动剥离 `Result` 外层）即组件类型。
+把函数注册为组件工厂，适用于第三方库类型或需要复杂初始化的对象。函数参数自动按类型注入（规则同 `#[inject]`）；返回类型（自动剥离 `Result` 外层）即组件类型。支持参数：
+
+| 参数 | 说明 |
+|---|---|
+| `name` | 组件名（默认用类型短名） |
+| `destroy_method` | 销毁逻辑（函数路径或闭包表达式） |
+| `condition` | 注册条件表达式（不满足则不注册） |
+| `primary` | 无值标记，声明该实例为返回类型的**首要实例**（见下） |
 
 ```rust
 #[provider(destroy_method = db_destroy)]
@@ -100,14 +106,11 @@ async fn db_factory(cfg: Arc<DbConfig>) -> Result<DatabaseConnection, DbErr> {
 async fn db_destroy(db: DatabaseConnection) -> anyhow::Result<()> { Ok(()) }
 ```
 
-#### 3. `#[primary]` —— 首要实例标记
-
-与 `#[provider]` 一起标注在同一函数上，声明该返回类型的**首要实例**：当按类型获取（`get_primary_component::<T>()` / `#[inject_primary]`）时优先返回它。必须显式指定实例名，且与 `#[provider]` 注册名一致。
+**`primary` 标记**：同类型有多个实例时，声明按类型获取（`get_component::<T>()`）时优先返回的那个。同一类型至多一个 primary。仅 `#[provider]` 支持——同类型多实例只能由多个工厂函数产生；`#[component]` / `#[configuration]` 一个类型只有一个实例，无需声明。
 
 ```rust
 // 两个同类型实例，mainDb 是按类型获取时的首要实例
-#[provider(name = "mainDb")]
-#[primary(name = "mainDb")]
+#[provider(name = "mainDb", primary)]
 async fn create_main_db() -> anyhow::Result<Database> { /* ... */ }
 
 #[provider(name = "backupDb")]
@@ -115,12 +118,32 @@ async fn create_backup_db() -> anyhow::Result<Database> { /* ... */ }
 
 #[component]
 struct UserService {
-    #[inject_primary] db: Arc<Database>,               // 注入 mainDb
+    #[inject] db: Arc<Database>,               // 优先注入 mainDb（primary）
     #[inject(name = "backupDb")] backup: Arc<Database>, // 按名注入
 }
 ```
 
-#### 4. `#[configuration]` —— 配置组件
+**参数注入**：provider 函数参数**默认全部注入**（`#[inject]` 标记可选，仅作声明）；支持按类型与按名两种方式：
+
+| 参数形态 | 行为 |
+|---|---|
+| `Arc<T>` | 按具体类型注入（primary 优先 → 短名快速路径 → 唯一实例兜底） |
+| `Arc<T>` + `#[inject(name = "x")]` | 按组件名精确注入 |
+| `Arc<dyn Trait>` | 按 trait 注入唯一实现（多个实现报错） |
+| `Arc<dyn Trait>` + `#[inject(name = "x")]` | 按 trait + 组件名注入指定实现 |
+| `Vec<Arc<dyn Trait>>` | 收集该 trait 全部实现（带 `#[inject(name = ...)]` 会编译报错） |
+
+```rust
+#[provider]
+async fn report_service(
+    cfg: Arc<DbConfig>,                                        // 按类型注入
+    #[inject(name = "backupDb")] backup: Arc<Database>,        // 按名注入具体类型
+    #[inject(name = "JsonParser")] json: Arc<dyn FileParser>,  // 按名注入 trait 实现
+    all: Vec<Arc<dyn FileParser>>,                             // 收集全部实现
+) -> anyhow::Result<ReportService> { /* ... */ }
+```
+
+#### 3. `#[configuration]` —— 配置组件
 
 将结构体注册为配置组件：启动时从全局配置（TOML）按 `prefix` 反序列化，要求结构体实现 `serde::Deserialize`。单参数简写：`#[configuration("server.http")]`；完整写法支持 `name` 与 `condition`。
 
@@ -130,16 +153,16 @@ struct UserService {
 struct DbConfig { url: String }
 ```
 
-#### 5. `#[inject]` —— 依赖注入标记
+#### 4. `#[inject]` —— 依赖注入标记
 
 作用于组件字段或 provider 参数。支持形式：
 
 | 形式 | 语义 |
 |---|---|
-| `#[inject]` | 按类型注入 |
+| `#[inject]` | 按类型注入（该类型声明了 primary 时优先返回 primary） |
 | `#[inject("name")]` / `#[inject(name = "name")]` | 按名称注入 |
 
-配合类型形态：`Arc<T>`（具体类型）、`Arc<dyn Trait>`（trait 唯一实现 / 按名称指定实现）、`Vec<Arc<dyn Trait>>`（全部实现）。
+配合类型形态：`Arc<T>`（具体类型）、`Arc<dyn Trait>`（trait 唯一实现 / 按名称指定实现）、`Vec<Arc<dyn Trait>>`（全部实现，不可按名）。
 
 ```rust
 #[component]
@@ -150,11 +173,7 @@ struct ParserController {
 }
 ```
 
-#### 6. `#[inject_primary]` —— primary 实例注入
-
-与 `#[inject]` 互斥，单独使用即隐含注入语义。仅限具体类型 `Arc<T>`，注入该类型的 primary 实例。
-
-#### 7. `#[injectable]` —— trait 实现注册
+#### 5. `#[injectable]` —— trait 实现注册
 
 作用于 `impl Trait for Type` 块，注册 trait → 实现映射：`trait_type_id` + `impl_type_id` + 类型擦除 accessor（记录 coercion 瞬间的真实 vtable，供 trait 还原）。
 
@@ -165,7 +184,32 @@ impl FileParser for JsonParser {
 }
 ```
 
-#### 8. `#[cron_job]` —— 声明式定时任务
+#### 6. `#[lifecycle]` —— 容器级周期回调
+
+作用于 `impl ComponentLifecycle for Type` 块，注册容器级批次回调（两个方法均有默认空实现，按需覆写）：
+
+| 方法 | 时机 |
+|---|---|
+| `after_all_ready(&self, container)` | 全部组件 create + init 完成后，按创建序正序批次执行 |
+| `before_destroy(&self, container)` | 全部组件准备销毁前，按创建序逆序批次执行（此时全局缓存未清空、全部组件存活可互相解析） |
+
+签名带容器 `Arc` 引用（与 `AppContext::container()` 返回形态一致），回调内 deref 直接查询任意组件；需传播所有权时显式 clone。
+
+```rust
+#[lifecycle]
+#[async_trait::async_trait]
+impl ComponentLifecycle for DatabaseComponent {
+    async fn after_all_ready(
+        &self,
+        container: &Arc<ComponentContainer>,
+    ) -> anyhow::Result<()> {
+        let cache = container.get_component::<CacheService>()?;
+        Ok(())
+    }
+}
+```
+
+#### 7. `#[cron_job]` —— 声明式定时任务
 
 作用于 `async fn`，用函数名注册任务：
 
@@ -174,9 +218,9 @@ impl FileParser for JsonParser {
 async fn heartbeat_task() { tracing::info!("心跳检查"); }
 ```
 
-#### 9. `#[event_listener]` —— 事件监听器
+#### 8. `#[event_listener]` —— 事件监听器
 
-作用于 impl 块，注册事件监听器（详见 core README 事件系统）：
+作用于 `impl EventListener<E> for Type` 块，将实现组件注册为该事件类型的监听器：发布器在容器就绪批次（`after_all_ready`）自动收集，事件发布时广播（详见 core README 事件系统）。监听器仅作为回调组件被发布器收集，**不参与 trait 注入**（无需 `#[injectable]`）。
 
 ```rust
 #[component]

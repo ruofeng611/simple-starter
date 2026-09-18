@@ -32,7 +32,7 @@ impl ComponentContainer {
     ///
     /// 包含四个步骤：
     /// 1. 注册阶段：扫描 inventory 工厂、校验名称唯一、条件过滤，构建创建阶段索引。
-    /// 2. 创建与初始化阶段：建图展开四类依赖（名称/trait/类型/primary）→ Kahn 拓扑
+    /// 2. 创建与初始化阶段：建图展开三类依赖（名称/trait/类型）→ Kahn 拓扑
     ///    排序 → 按序创建，每个组件创建完成后**立即初始化**（init 语义：注入完成后
     ///    即执行，对应 Spring `@PostConstruct`；拓扑序保证依赖组件先完成初始化）。
     /// 3. 容器就绪阶段：按创建顺序批次执行 `ComponentLifecycle::after_all_ready`
@@ -140,9 +140,6 @@ struct PlanEntry {
     /// 具体类型依赖的 TypeId 列表（建图时展开为该类型全部实例；
     /// 无名称注入 `Arc<T>` 时使用，组件可能自定义名称）
     type_dependencies: Vec<TypeId>,
-    /// primary 依赖的 TypeId 列表（`#[inject_primary]` 生成；
-    /// 建图时仅建边到该类型的 primary 实例，不强制创建同类型其他实例）
-    primary_dependencies: Vec<TypeId>,
     /// 条件声明：None 无条件注册；Some 为注册期已求值的条件
     condition: Option<ComponentCondition>,
 }
@@ -180,17 +177,15 @@ fn register_components(
             .expect("repository must be mutable during registration")
             .insert(name.to_string(), processor);
 
-        // 4. 记录创建计划（名称依赖 + trait 依赖 + 类型依赖 + primary 依赖）
+        // 4. 记录创建计划（名称依赖 + trait 依赖 + 类型依赖）
         let trait_type_ids: Vec<TypeId> = factory.trait_dependencies.to_vec();
         let type_type_ids: Vec<TypeId> = factory.type_dependencies.to_vec();
-        let primary_type_ids: Vec<TypeId> = factory.primary_dependencies.to_vec();
         entries.insert(
             name.to_string(),
             PlanEntry {
                 dependencies: Vec::from(factory.dependencies),
                 trait_dependencies: trait_type_ids,
                 type_dependencies: type_type_ids,
-                primary_dependencies: primary_type_ids,
                 condition: factory.condition.map(|get_condition| get_condition()),
             },
         );
@@ -286,7 +281,7 @@ fn build_primary_index(container: &ComponentContainer) -> anyhow::Result<()> {
             .is_some_and(|r| r.contains_key(reg.name))
         {
             return Err(anyhow!(
-                "Primary instance '{}' is not registered. #[primary] name must match a registered provider component name.",
+                "Primary instance '{}' is not registered (its provider was likely removed by a condition).",
                 reg.name
             ));
         }
@@ -341,8 +336,8 @@ async fn run_creation(
     container: &Arc<ComponentContainer>,
     config: &Value,
 ) -> anyhow::Result<()> {
-    // 1. 建图：展开四类依赖为边（依赖项 → 依赖者）
-    let graph = build_creation_graph(&plan, container)?;
+    // 1. 建图：展开三类依赖为边（依赖项 → 依赖者）
+    let graph = build_creation_graph(&plan)?;
 
     // 2. Kahn 拓扑排序：得到"依赖先于依赖者"的创建顺序
     let order = topo_sort_creation(&graph)?;
@@ -356,19 +351,15 @@ async fn run_creation(
     Ok(())
 }
 
-/// 建图：把每个组件的四类依赖声明展开为具体组件名，构建依赖边
+/// 建图：把每个组件的三类依赖声明展开为具体组件名，构建依赖边
 ///
 /// 依赖声明来自注册期快照，创建期无动态依赖：
 /// - 名称依赖：直接建边（依赖未注册 fail-fast）
 /// - trait 依赖：展开为全部实现组件的全部实例（无实现/无实例 fail-fast）
 /// - 类型依赖：展开为该类型的全部实例（无实例 fail-fast）
-/// - primary 依赖：仅建边到该类型的 primary 实例（无声明 fail-fast）
 ///
-/// 四类依赖在建边时统一去重合并，否则入度与重复边都会失真。
-fn build_creation_graph(
-    plan: &LoadPlan,
-    container: &ComponentContainer,
-) -> anyhow::Result<CreationGraph> {
+/// 三类依赖在建边时统一去重合并，否则入度与重复边都会失真。
+fn build_creation_graph(plan: &LoadPlan) -> anyhow::Result<CreationGraph> {
     let mut dependents: HashMap<String, Vec<String>> = HashMap::new();
     let mut in_degree: HashMap<String, usize> = HashMap::new();
 
@@ -445,23 +436,6 @@ fn build_creation_graph(
             for impl_name in instance_names {
                 deps.insert(impl_name.clone());
             }
-        }
-
-        // 4. primary 依赖：仅建边到该类型的 primary 实例
-        for type_id in &entry.primary_dependencies {
-            // 注册期 build_primary_index 已校验 primary 名对应的组件存在
-            let primary_name = container
-                .primary_by_type
-                .get()
-                .and_then(|m| m.get(type_id))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Component '{}' depends on a primary instance (TypeId={:?}) that is not registered; a #[primary] must be declared on one of the type's providers",
-                        name,
-                        type_id
-                    )
-                })?;
-            deps.insert(primary_name.clone());
         }
 
         // 入度 = 去重后的直接依赖数；反向登记依赖者

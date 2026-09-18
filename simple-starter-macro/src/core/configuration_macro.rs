@@ -51,7 +51,6 @@ pub(crate) fn configuration_macro(args: TokenStream, input: TokenStream) -> Toke
                 dependencies: &[],
                 trait_dependencies: &[],
                 type_dependencies: &[],
-                primary_dependencies: &[],
                 name: #final_component_name,
                 condition: #condition_impl,
                 constructor: || {

@@ -1,6 +1,6 @@
 [package]
 name = "simple-starter-core"
-version = "4.0.3"
+version = "4.1.0"
 edition = "2024"
 
 [dependencies]

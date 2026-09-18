@@ -1,6 +1,5 @@
 //! 应用事件：事件标记 trait 与监听器注册结构。
 
-use crate::model::component::Injectable;
 use crate::event::event_listener::AnyEventListener;
 use std::any::{Any, TypeId};
 use std::sync::Arc;
@@ -21,17 +20,14 @@ impl<T: Any + Send + Sync> AppEvent for T {}
 pub struct EventListenerRegistration {
     /// `TypeId::of::<E>()`：监听的事件类型
     pub event_type_id: TypeId,
-    /// `TypeId::of::<dyn EventListener<E>>()`：监听器 trait 的 TypeId（查 `TRAIT_OBJ_CACHE` 用）
-    pub listener_trait_type_id: TypeId,
     /// `TypeId::of::<ImplType>()`：实现组件具体类型（查实例名索引用）
     pub impl_type_id: TypeId,
-    /// 桥接适配器构造：`Arc<dyn Injectable> → Option<Arc<dyn AnyEventListener>>`
+    /// 桥接适配器构造：`Arc<dyn Any + Send + Sync> → Option<Arc<dyn AnyEventListener>>`
     ///
-    /// 实现为 downcast 还原链路（全程 safe）：
-    /// 正向 upcast 到 `Any` → `downcast::<ImplType>()` → 正向 coercion 到
-    /// `dyn EventListener<E>`，不依赖任何 vtable 布局假设；
+    /// 实现为 downcast 还原链路（全程 safe）：`downcast::<ImplType>()` →
+    /// 正向 coercion 到 `dyn EventListener<E>`，不依赖任何 vtable 布局假设；
     /// downcast 失败（类型不匹配）返回 `None`，由收集方跳过。
-    pub adapter: fn(Arc<dyn Injectable>) -> Option<Arc<dyn AnyEventListener>>,
+    pub adapter: fn(Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn AnyEventListener>>,
 }
 
 // 自动收集所有标记了 EventListenerRegistration 的静态变量

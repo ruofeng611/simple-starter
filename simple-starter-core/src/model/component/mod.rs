@@ -214,9 +214,6 @@ pub struct ComponentProcessorFactory {
     /// 具体类型依赖：直接存储 `TypeId::of::<ConcreteType>()`（const fn 直接求值）
     /// 无名称注入 `Arc<T>` 时使用（组件可能自定义名称，短名不能作为依赖名）
     pub type_dependencies: &'static [TypeId],
-    /// primary 依赖：直接存储 `TypeId::of::<ConcreteType>()`，由 `#[inject_primary]` 生成
-    /// 建图时仅建边到该类型的 primary 实例，不强制创建同类型其他实例
-    pub primary_dependencies: &'static [TypeId],
     pub name: &'static str,
     /// 条件声明：None 表示无条件注册；Some 为惰性构造函数指针，
     /// 注册期调用一次求值，不满足则组件不注册（不参与后续创建）
@@ -239,13 +236,14 @@ pub struct TraitImplRegistration {
 
 /// 编译期 primary（首要）实例注册结构体（供 `inventory` 收集）
 ///
-/// 由 `#[primary]` 在 provider 函数上生成，声明"该具体类型的首要实例"：
+/// 由 `#[provider(primary)]` 生成，声明"该具体类型的首要实例"：
 /// 当框架按类型获取组件时优先返回它。启动注册期被 `loader`
-/// 读入构建 primary 索引，并校验名字对应的组件存在、同类型 primary 唯一。
+/// 读入构建 primary 索引，并校验名字对应的组件存在（其 provider 可能被
+/// 条件过滤移除）、同类型 primary 唯一。
 pub struct PrimaryRegistration {
     /// `TypeId::of::<ConcreteType>()`（const fn，static 初始化中直接求值）
     pub type_id: TypeId,
-    /// primary 实例的组件名（必须与 `#[provider]` 注册的组件名一致）
+    /// primary 实例的组件名（与 `#[provider]` 的 name 参数同源，天然一致）
     pub name: &'static str,
 }
 
@@ -397,18 +395,31 @@ impl ComponentContainer {
 
     /// 获取组件实例（按类型）
     ///
-    /// 先按类型短名（默认组件名）快速查找；未命中时（组件自定义名称）
-    /// 按具体类型收集全部实例名：
-    /// - 恰好一个 → 返回该实例
-    /// - 多个 → `AmbiguousComponent`
-    /// - 零个 → `NotFound`
+    /// 解析顺序：
+    /// 1. primary 优先：该类型注册了首要实例（`#[provider(primary)]`）→ 直接返回
+    /// 2. 默认名快速路径：组件名恰为类型短名 → 直接命中
+    /// 3. 类型唯一性兜底：按具体类型收集全部实例名
+    ///    - 恰好一个 → 返回该实例
+    ///    - 多个 → `AmbiguousComponent`
+    ///    - 零个 → `NotFound`
     pub fn get_component<T>(&self) -> Result<Arc<T>, ComponentError>
     where
         T: Any + Send + Sync + 'static,
     {
-        let short_name = get_short_type_name::<T>();
+        let type_id = TypeId::of::<T>();
 
-        // 1. 快速路径：默认命名（类型短名）直接命中
+        // 1. primary 优先：显式声明的首要实例高于命名约定
+        if let Some(primary_name) = self
+            .primary_by_type
+            .get()
+            .and_then(|m| m.get(&type_id))
+            .cloned()
+        {
+            return self.get_component_by_name(primary_name);
+        }
+
+        // 2. 快速路径：默认命名（类型短名）直接命中
+        let short_name = get_short_type_name::<T>();
         if self
             .repository
             .get()
@@ -417,11 +428,11 @@ impl ComponentContainer {
             return self.get_component_by_name(short_name);
         }
 
-        // 2. 兜底：组件自定义了名称，按具体类型收集全部实例名
+        // 3. 兜底：组件自定义了名称，按具体类型收集全部实例名
         let names = self
             .type_instance_names
             .get()
-            .and_then(|m| m.get(&TypeId::of::<T>()))
+            .and_then(|m| m.get(&type_id))
             .cloned()
             .unwrap_or_default();
         match names.as_slice() {
@@ -435,31 +446,6 @@ impl ComponentContainer {
                 candidates: names,
             }),
         }
-    }
-
-    /// 获取首要（primary）实例（按类型）
-    ///
-    /// 供插件方等"不知道用户会取什么名、必须按类型获取"的场景使用：
-    /// 1. 该类型注册了 primary → 直接返回 primary 实例
-    /// 2. 未注册 primary → 回退为 `get_component` 语义（默认名快速路径 + 按类型唯一实例）
-    pub fn get_primary_component<T>(&self) -> Result<Arc<T>, ComponentError>
-    where
-        T: Any + Send + Sync + 'static,
-    {
-        let type_id = TypeId::of::<T>();
-
-        // 1. primary 优先：该类型注册了首要实例，直接返回
-        if let Some(primary_name) = self
-            .primary_by_type
-            .get()
-            .and_then(|m| m.get(&type_id))
-            .cloned()
-        {
-            return self.get_component_by_name(primary_name);
-        }
-
-        // 2. 回退：与 get_component 一致的默认名快速路径 + 类型唯一性兜底
-        self.get_component::<T>()
     }
 
     /// 获取组件实例（按名称）

@@ -5,7 +5,6 @@ mod core {
     pub(crate) mod event_listener_macro;
     pub(crate) mod injectable_macro;
     pub(crate) mod lifecycle_macro;
-    pub(crate) mod primary_macro;
     pub(crate) mod provider_macro;
 }
 
@@ -81,6 +80,14 @@ pub fn injectable(args: TokenStream, item: TokenStream) -> TokenStream {
 /// 将函数转换为组件工厂，用于创建无法直接修改源码的第三方类型实例。
 /// 返回值必须为 `Result<T>` 或 `anyhow::Result<T>`，宏会自动提取内部类型 `T` 作为组件类型。
 ///
+/// 参数：
+/// - `name`：组件实例名（可选，缺省取类型短名）；
+/// - `destroy_method`：销毁逻辑（可选，函数路径或闭包表达式）；
+/// - `condition`：注册条件（可选，注册期求值一次）；
+/// - `primary`：无值标记，声明该实例为返回类型的首要（primary）实例，
+///   按类型注入时优先返回。同一类型至多一个 primary，
+///   因此该标记通常用于同类型多实例场景。
+///
 /// 用法：
 /// ```rust
 /// #[provider]
@@ -88,31 +95,17 @@ pub fn injectable(args: TokenStream, item: TokenStream) -> TokenStream {
 ///     Ok(reqwest::Client::new())
 /// }
 /// ```
-#[proc_macro_attribute]
-pub fn provider(args: TokenStream, item: TokenStream) -> TokenStream {
-    core::provider_macro::provider_macro(args, item)
-}
-
-/// 标记首要（primary）实例。
 ///
-/// 必须与 `#[provider]` 一起标注在同一函数上，声明该函数返回值类型的首要实例：
-/// 当框架按类型获取组件时优先返回它（见 `ComponentContainer::get_primary_component`）。
-/// 由于存在 primary 通常意味着同类型有多个实例，因此必须显式指定实例名，
-/// 且该名字必须与 `#[provider]` 注册的组件名一致。
-///
-/// 用法：
+/// 标记首要实例（同类型多实例场景）：
 /// ```rust
-/// #[provider(name = "mainRedis")]
-/// #[primary(name = "mainRedis")]
+/// #[provider(name = "mainRedis", primary)]
 /// pub fn main_redis() -> anyhow::Result<redis::Client> {
 ///     Ok(redis::Client::open("redis://main")?)
 /// }
 /// ```
-///
-/// 也支持位置参数简写：`#[primary("mainRedis")]`。
 #[proc_macro_attribute]
-pub fn primary(args: TokenStream, item: TokenStream) -> TokenStream {
-    core::primary_macro::primary_macro(args, item)
+pub fn provider(args: TokenStream, item: TokenStream) -> TokenStream {
+    core::provider_macro::provider_macro(args, item)
 }
 
 /// 定义一个配置组件。
@@ -207,7 +200,6 @@ pub fn lifecycle(args: TokenStream, item: TokenStream) -> TokenStream {
 /// 作用在 `impl EventListener<E> for Type` 块上，将实现组件注册为该事件类型的监听器：
 /// 发布器（框架内置实现，用户可注册自己的 `EventPublisher` 实现覆盖）在容器
 /// 就绪批次（`after_all_ready`）自动收集，事件发布时同步广播。
-/// 同时生成 trait 实现映射，`#[inject] Vec<Arc<dyn EventListener<E>>>` 可正常注入。
 ///
 /// 用法：
 /// ```rust

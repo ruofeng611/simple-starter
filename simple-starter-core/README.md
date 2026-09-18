@@ -10,7 +10,7 @@
 
 1. **注册**：`#[component]` / `#[provider]` / `#[configuration]` 宏在编译期生成静态注册元数据（`ComponentProcessorFactory`），通过 `inventory` 自动收集（Rust 无反射，依赖编译期静态收集）。
 2. **条件过滤**：注册期统一评估 `condition` 表达式，不满足者不参与装配。
-3. **依赖排序**：基于组件声明的四类依赖（名称 / trait / 类型 / primary）构建有向图，Kahn 拓扑排序得到创建顺序；存在依赖环时排序结果数小于组件总数，报错并给出环路径。
+3. **依赖排序**：基于组件声明的三类依赖（名称 / trait / 类型）构建有向图，Kahn 拓扑排序得到创建顺序；存在依赖环时排序结果数小于组件总数，报错并给出环路径。
 4. **创建**：按依赖序调用构造函数，非注入字段使用 `Default::default()` 填充。
 5. **初始化**：每个组件创建完成后**立即**执行 `init_method`（注入完成后即执行，对应 Spring `@PostConstruct`；拓扑序保证依赖组件先完成 create + init，init 内可安全访问全部依赖组件）。方法签名 `async fn init(&self)`：以 `Arc<T>` 共享引用调用，实例所有权仍在仓库，仅能读取/借用自身。
 6. **容器就绪批次（可选）**：全部组件创建 + 初始化完成后，按创建序批次执行 `ComponentLifecycle::after_all_ready`（对应 Spring `SmartInitializingSingleton`）。
@@ -23,12 +23,11 @@
 
 | 字段/参数形态 | 注入语义 | 依赖声明 |
 |---|---|---|
-| `Arc<T>`（无名称） | 按具体类型注入（短名快速路径 + 按类型唯一实例兜底，自定义名也能命中） | 类型 TypeId |
+| `Arc<T>`（无名称） | 按具体类型注入（primary 优先 → 短名快速路径 → 按类型唯一实例兜底，自定义名也能命中） | 类型 TypeId |
 | `Arc<T>`（有名称） | 按组件名精确注入 | 组件名 |
 | `Arc<dyn Trait>`（无名称） | 按 trait 注入唯一实现（多个实现报错） | trait TypeId |
 | `Arc<dyn Trait>`（有名称） | 按 trait + 名称注入指定实现 | 组件名 |
-| `Vec<Arc<dyn Trait>>` | 收集该 trait 的全部实现 | trait TypeId |
-| `Arc<T>` + `#[inject_primary]` | 注入该类型的 primary（首要）实例 | 类型 TypeId |
+| `Vec<Arc<dyn Trait>>` | 收集该 trait 的全部实现（不可按名） | trait TypeId |
 
 ### 3. trait 对象注入与"trait 还原"原理
 
@@ -111,9 +110,8 @@ fn main() {
 | `get_config_to_struct::<T>(&config, "prefix")` | 按前缀反序列化配置为结构体 |
 | `insert_extension(v)` / `get_extension::<T>()` / `get_extension_mut::<T>()` / `remove_extension::<T>()` | 扩展上下文（AnyMap），插件间传递协作数据 |
 | `add_task_spawn_factory_in_context(f)` | 注册异步后台任务（接收 CancellationToken，优雅退出） |
-| `get_component::<T>()` | 按类型获取组件（短名快速路径，自定义名时按唯一实例兜底） |
+| `get_component::<T>()` | 按类型获取组件（primary 优先 → 短名快速路径 → 唯一实例兜底） |
 | `get_component_by_name::<T, _>("name")` | 按名称获取组件 |
-| `get_primary_component::<T>()` | 按类型获取 primary 实例（未声明 primary 时回退为唯一实例） |
 | `get_component_by_trait::<dyn Trait>()` | 按 trait 获取唯一实现 |
 | `get_component_by_trait_and_name::<dyn Trait>("name")` | 按 trait + 名称获取指定实现 |
 | `get_components_by_trait::<dyn Trait>()` | 收集 trait 全部实现 `Vec<Arc<dyn Trait>>` |
@@ -144,18 +142,16 @@ fn main() {
 | 宏 | 作用 |
 |---|---|
 | `#[component]` | 标记结构体为组件：`name` / `init_method` / `destroy_method` / `condition` |
-| `#[provider]` | 标记函数为组件工厂（适用于第三方类型或复杂初始化） |
-| `#[primary]` | 配合 `#[provider]` 声明返回类型的首要实例 |
+| `#[provider]` | 标记函数为组件工厂：`name` / `destroy_method` / `condition` / `primary` |
 | `#[configuration]` | 标记结构体为配置组件，从全局配置反序列化 |
 | `#[inject]` | 标记字段/参数注入依赖 |
-| `#[inject_primary]` | 标记字段/参数按 primary 实例注入 |
 | `#[injectable]` | 标记 trait 实现，注册 trait → 实现映射 |
 | `#[lifecycle]` | 标记 `ComponentLifecycle` 实现，注册容器级周期回调（`after_all_ready` / `before_destroy`） |
 | `#[cron_job]` | 声明式定时任务 |
 | `#[event_listener]` | 声明式事件监听器 |
 
 ```rust
-use simple_starter_core::{component, configuration, cron_job, inject, injectable, provider, primary};
+use simple_starter_core::{component, configuration, cron_job, inject, injectable, provider};
 
 // 配置组件：从 TOML 的 [database] 段反序列化
 #[derive(serde::Deserialize)]
@@ -169,8 +165,7 @@ async fn db_factory(cfg: std::sync::Arc<DbConfig>) -> anyhow::Result<DatabaseCon
 }
 
 // 多实例 + primary：mainDb 是按类型获取时的首要实例
-#[provider(name = "mainDb")]
-#[primary(name = "mainDb")]
+#[provider(name = "mainDb", primary)]
 async fn main_db() -> anyhow::Result<DatabaseConnection> { /* ... */ }
 
 // 结构体组件：字段注入依赖，init_method 在注入完成后立即执行
@@ -218,7 +213,7 @@ impl Plugin for MyPlugin {
 
 ### 5. Injectable trait（可注入 trait 的 supertrait）
 
-所有可注入 trait 必须继承 `Injectable`（`Any + Send + Sync` 的 blanket impl），使所有 trait 对象可统一类型擦除：
+所有**可注入 trait** 必须继承 `Injectable`（`Any + Send + Sync` 的 blanket impl），使 trait 对象可统一擦除为 `Arc<dyn Injectable>` 存入注入缓存：
 
 ```rust
 use simple_starter_core::Injectable;
@@ -227,6 +222,8 @@ pub trait FileParser: Injectable {
     fn parse(&self, content: &str) -> anyhow::Result<Vec<String>>;
 }
 ```
+
+> 仅参与注入的 trait 需要此约束。容器级周期回调（`ComponentLifecycle`）与事件监听器（`EventListener` / `AnyEventListener`）不参与 trait 注入，直接以 `Any + Send + Sync` 为 supertrait，不继承 `Injectable`。
 
 ### 6. ComponentCondition（条件注册）
 
@@ -276,7 +273,7 @@ impl LoginService {
 ```
 
 - `AppEvent`：事件标记 trait（blanket impl）
-- `EventListener<E>`：监听器 trait，`#[event_listener]` 作用于 impl 块完成注册
+- `EventListener<E>`：监听器 trait，`#[event_listener]` 作用于 impl 块完成注册；监听器仅作为回调组件被发布器收集，**不参与 trait 注入**（不继承 `Injectable`）
 - `EventPublisher`：发布器 trait；框架提供默认实现（`on_missing_trait` 条件注册，用户注册自己的 `EventPublisher` 实现时自动退位）；`EventPublisherExt::publish_event` 是便捷方法
 - 分派：按事件具体类型 `type_id` 分桶，监听器失败仅记日志，不中断广播
 - 生命周期对齐：监听器索引在容器就绪批次（`after_all_ready`）收集为强引用快照并冻结（运行期零锁分派）；销毁前批次（`before_destroy`）清空。强引用免去分派时的升级开销，`before_destroy` 清空负责断环：监听器常注入 `Arc<dyn EventPublisher>`（对发布器持强引用），若发布器再强引用监听器则两者互持形成引用环，组件永远无法释放，销毁时 `Arc` 计数无法归 1 而失败。清空索引释放监听器强引用后，销毁循环中各组件的 `Arc` 计数才能归 1

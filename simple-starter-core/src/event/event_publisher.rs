@@ -90,18 +90,18 @@ impl DefaultEventPublisher {
                 continue;
             };
             for name in names.iter() {
-                let cache_key = (reg.listener_trait_type_id, name.clone());
-                let Some(arc) = container
-                    .trait_obj_cache
+                let Some(arc_any) = container
+                    .repository
                     .get()
-                    .and_then(|m| m.get(&cache_key))
+                    .and_then(|r| r.get(name))
+                    .and_then(|p| p.get_inner_arc_any())
                 else {
                     continue;
                 };
                 // adapter 还原出 `Arc<dyn AnyEventListener>`，其内部即组件实例的
                 // 强引用：索引直接持有，分派免 upgrade；销毁前由 before_destroy
                 // 清空断环
-                let Some(listener) = (reg.adapter)(arc.obj.clone()) else {
+                let Some(listener) = (reg.adapter)(arc_any) else {
                     continue;
                 };
                 // 登记日志：发布器收集到的监听器实例名与监听事件类型
