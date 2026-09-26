@@ -2,7 +2,7 @@
 
 `simple-starter-macro` 提供 simple-starter 框架的全部**过程宏**，负责将声明式注解展开为组件注册、依赖注入、生命周期回调注册、路由挂载、安全资源收集等底层代码。
 
-> **注意**：本 crate 是纯过程宏 crate，用户**无需直接依赖**它——核心宏由 `simple-starter-core` 重导出，Web 宏由 `simple-starter-web` 重导出，安全宏由 `simple-starter-security` 重导出。仅在编写插件模块（需要同时使用三个模块的宏）时可能需要直接依赖。
+> **注意**：本 crate 是纯过程宏 crate，用户**无需直接依赖**它——核心宏由 `simple-starter-core` 重导出，定时任务宏由 `simple-starter-schedule` 重导出，Web 宏由 `simple-starter-web` 重导出，安全宏由 `simple-starter-security` 重导出。仅在编写插件模块（需要同时使用多个模块的宏）时可能需要直接依赖。
 
 ## 一、基本原理
 
@@ -209,16 +209,7 @@ impl ComponentLifecycle for DatabaseComponent {
 }
 ```
 
-#### 7. `#[cron_job]` —— 声明式定时任务
-
-作用于 `async fn`，用函数名注册任务：
-
-```rust
-#[cron_job("*/5 * * * * *")]  // 每 5 秒执行
-async fn heartbeat_task() { tracing::info!("心跳检查"); }
-```
-
-#### 8. `#[event_listener]` —— 事件监听器
+#### 7. `#[event_listener]` —— 事件监听器
 
 作用于 `impl EventListener<E> for Type` 块，将实现组件注册为该事件类型的监听器：发布器在容器就绪批次（`after_all_ready`）自动收集，事件发布时广播（详见 core README 事件系统）。监听器仅作为回调组件被发布器收集，**不参与 trait 注入**（无需 `#[injectable]`）。
 
@@ -231,6 +222,40 @@ impl EventListener<UserLoginEvent> for LoginListener {
     async fn on_event(&self, event: &UserLoginEvent) -> anyhow::Result<()> { Ok(()) }
 }
 ```
+
+### 定时任务宏（由 simple-starter-schedule 重导出）
+
+| 宏 | 作用 |
+|---|---|
+| `#[cron_job]` | 自由函数定时任务：`expr` / `every` / `name` 参数，触发规则可留空由配置提供 |
+| `#[scheduled]` | 组件 `impl` 块级任务声明：块内带 `#[cron_job(...)]` 标记的方法成为任务体 |
+
+```rust
+use simple_starter_schedule::{cron_job, scheduled};
+
+// 自由函数形态：无参 async fn
+#[cron_job("*/5 * * * * *")]
+async fn heartbeat_task() { tracing::info!("心跳检查"); }
+
+#[cron_job(every = "30s")]
+async fn poll_task() { /* ... */ }
+
+// 组件方法形态：任务体是方法本身，其依赖由所属组件在装配期注入
+#[component]
+pub struct HeartbeatService {
+    #[inject]
+    repository: std::sync::Arc<Repository>,
+}
+
+#[scheduled]
+impl HeartbeatService {
+    #[cron_job("*/5 * * * * *")]
+    async fn tick(&self) { /* ... */ }
+}
+```
+
+两种形态均要求 `async`；自由函数不得有参数，方法仅接收 `&self` 且返回 `()`。
+任务体不接收触发参数，触发规则由宏默认值与配置共同决定。
 
 ### Web 宏（由 simple-starter-web 重导出）
 

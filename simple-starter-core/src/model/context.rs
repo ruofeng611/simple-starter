@@ -5,6 +5,7 @@
 //! 钩子均以 `&mut AppContext` 访问（装配期 assemble 仅经 [`Extensions`] 协作面）：
 //!
 //! - `config`：合并后的全局配置（启动时写入一次，`Arc` 支持廉价 clone）
+//! - `app_offset`：应用通用时区偏移（日志时间戳与定时任务触发计算共用）
 //! - `container`：组件容器（组件查询与按 trait/类型解析）
 //! - `extensions`：扩展存储（插件间挂载/消费自定义协作数据）
 //! - `task_spawns`：异步任务创建工厂（插件/钩子注册后台任务）
@@ -26,6 +27,7 @@ use serde::Deserialize;
 use std::any::Any;
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
+use time::UtcOffset;
 use tokio_util::sync::CancellationToken;
 use toml::Value;
 
@@ -42,6 +44,8 @@ pub(crate) type TaskSpawnsFactory = Box<dyn FnOnce(CancellationToken) -> BoxFutu
 pub struct AppContext {
     /// 合并后的全局配置（启动时写入一次；Arc 支持廉价 clone 传入后台任务）
     config: OnceLock<Arc<Value>>,
+    /// 应用通用时区偏移（日志与定时任务共用，启动时解析一次后冻结）
+    app_offset: OnceLock<UtcOffset>,
     /// 组件容器
     container: Arc<ComponentContainer>,
     /// 扩展存储（插件协作数据）
@@ -55,10 +59,28 @@ impl AppContext {
     pub(crate) fn new() -> Self {
         Self {
             config: OnceLock::new(),
+            app_offset: OnceLock::new(),
             container: Arc::new(ComponentContainer::new()),
             extensions: Extensions::new(),
             task_spawns: Vec::new(),
         }
+    }
+
+    /// 写入应用通用时区偏移（只能写入一次，启动时由 `Application` 解析后调用）
+    pub(crate) fn set_app_offset(&self, offset: UtcOffset) -> Result<(), UtcOffset> {
+        self.app_offset.set(offset)
+    }
+
+    /// 获取应用通用时区偏移（日志时间戳与定时任务触发计算共用）
+    ///
+    /// 仅在 `Application::run()` 解析时区后可用；在此之前调用 panic（fail-fast）。
+    pub fn app_offset(&self) -> UtcOffset {
+        self.app_offset
+            .get()
+            .copied()
+            .log_expect(
+                "Application timezone not initialized. Ensure Application::run() is called.",
+            )
     }
 
     /// 写入合并后的全局配置（只能写入一次，启动时由 `Application` 调用）

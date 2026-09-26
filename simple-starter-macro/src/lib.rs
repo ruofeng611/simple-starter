@@ -1,7 +1,6 @@
 mod core {
     pub(crate) mod component_macro;
     pub(crate) mod configuration_macro;
-    pub(crate) mod cron_job_macro;
     pub(crate) mod event_listener_macro;
     pub(crate) mod injectable_macro;
     pub(crate) mod lifecycle_macro;
@@ -18,6 +17,11 @@ mod security {
     pub(crate) mod security_controller_macro;
     pub(crate) mod security_macro;
     pub(crate) mod security_utils;
+}
+
+mod schedule {
+    pub(crate) mod cron_job_macro;
+    pub(crate) mod scheduled_macro;
 }
 
 mod utils {
@@ -142,22 +146,6 @@ pub fn inject(_args: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
-/// 定义定时任务。
-///
-/// 将 async 函数注册为 CronJob。
-///
-/// 用法：
-/// ```rust
-/// #[cron_job("0 0 * * * *")]
-/// async fn daily_cleanup() {
-///     // 每小时执行一次
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn cron_job(args: TokenStream, item: TokenStream) -> TokenStream {
-    core::cron_job_macro::cron_job_macro(args, item)
-}
-
 /// 注册容器级生命周期回调实现。
 ///
 /// 作用在 `impl ComponentLifecycle for Type` 块上，将实现组件注册为容器级周期
@@ -227,6 +215,57 @@ pub fn event_listener(args: TokenStream, item: TokenStream) -> TokenStream {
     };
     core::event_listener_macro::event_listener_on_impl(args, item_impl)
         .unwrap_or_else(|e| e.to_compile_error().into())
+}
+
+// =============================================================================
+// 定时任务模块宏
+// =============================================================================
+
+/// 定义定时任务（自由函数形态）。
+///
+/// 作用于无参 `async fn`，将函数注册为定时任务。触发规则可以在宏上写默认值，
+/// 也可以留空由配置提供（`[cron.jobs."<任务名>"]`）。
+///
+/// 用法：
+/// ```rust
+/// #[cron_job("*/5 * * * * *")]  // 每 5 秒
+/// async fn heartbeat_task() { /* ... */ }
+///
+/// #[cron_job(every = "30s")]    // 固定间隔
+/// async fn poll_task() { /* ... */ }
+///
+/// #[cron_job]                   // 触发规则来自配置
+/// async fn cleanup_task() { /* ... */ }
+/// ```
+#[proc_macro_attribute]
+pub fn cron_job(args: TokenStream, item: TokenStream) -> TokenStream {
+    schedule::cron_job_macro::cron_job_macro(args, item)
+}
+
+/// 声明组件方法为定时任务。
+///
+/// 作用于组件类型的 `impl` 块：带 `#[cron_job(...)]` 标记的方法被注册为定时任务，
+/// 任务体即该方法本身，依赖由所属组件在装配期完成注入。
+///
+/// 方法要求：`async fn`、仅接收 `&self`、返回 `()`。
+///
+/// 用法：
+/// ```rust
+/// #[component]
+/// pub struct HeartbeatService {
+///     #[inject]
+///     repository: std::sync::Arc<Repository>,
+/// }
+///
+/// #[scheduled]
+/// impl HeartbeatService {
+///     #[cron_job("*/5 * * * * *")]
+///     async fn tick(&self) { /* ... */ }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn scheduled(args: TokenStream, item: TokenStream) -> TokenStream {
+    schedule::scheduled_macro::scheduled_macro(args, item)
 }
 
 // =============================================================================

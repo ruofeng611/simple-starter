@@ -215,3 +215,12 @@ pub(crate) fn get_result_inner_type(ty: &Type) -> Option<&Type> {
     }
     None
 }
+
+/// 判断类型是否为单元类型 `()`
+///
+/// # 用途
+/// 校验方法或函数的返回类型：显式写出的 `()` 与省略返回类型语义一致，
+/// 两者都应被同一判定覆盖。
+pub(crate) fn is_unit_type(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}

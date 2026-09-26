@@ -43,16 +43,24 @@ impl ComponentContainer {
     /// 此处直接向下传递自身的 Arc 克隆。
     /// `config` 为合并后的全局配置（`&Arc` 借用，与容器接收者形态统一）：
     /// 内部按需 clone（组件 create 分发）。
-    pub(crate) async fn load(self: &Arc<Self>, config: &Arc<Value>) -> anyhow::Result<()> {
+    /// `enable_global_snapshot` 控制是否安装全局容器快照（`app_container` 的数据来源）。
+    pub(crate) async fn load(
+        self: &Arc<Self>,
+        config: &Arc<Value>,
+        enable_global_snapshot: bool,
+    ) -> anyhow::Result<()> {
         let plan = register_components(self, config)?;
         run_creation(plan, self, config).await?;
         // 全部组件创建与初始化完成：冻结全部存储为不可变快照，
         // 此后运行期查询零锁读，装配期写被类型层面拒绝
         self.freeze_all();
         run_after_all_ready(self).await?;
-        // 批次后安装组件容器快照：批次回调经钩子参数 `&Arc<ComponentContainer>`
-        // 访问容器（不依赖全局快照），此后运行期任意线程可经 `app_container`读取
-        install_container_snapshot(self);
+        if enable_global_snapshot {
+            // 批次后安装组件容器快照：批次回调经钩子参数 `&Arc<ComponentContainer>`
+            // 访问容器（不依赖全局快照），此后运行期任意线程可经 `app_container`读取
+            install_container_snapshot(self);
+            tracing::info!("Global container snapshot installed: [app_container]");
+        }
         Ok(())
     }
 
@@ -82,8 +90,8 @@ impl ComponentContainer {
             return Ok(());
         }
 
-        // 2. 清空全局组件容器快照（before_destroy 批次前）：批次回调经
-        //    钩子参数访问容器（不依赖全局快照），此后运行期迟到读者
+        // 2. 清空全局组件容器快照（before_destroy 批次前；未安装时为空操作）：
+        //    批次回调经钩子参数访问容器（不依赖全局快照），此后运行期迟到读者
         //    经 `app_container` 安全失败
         clear_container_snapshot();
 

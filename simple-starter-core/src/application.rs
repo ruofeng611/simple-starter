@@ -1,10 +1,9 @@
 use crate::loaders::config_loader::global_config_load;
 use crate::model::context::global_context::{clear_config_snapshot, install_config_snapshot};
 use crate::model::context::{AppContext, TaskSpawnsFactory};
-use crate::model::job::CronJob;
 use crate::model::plugin::Plugin;
 use crate::utils::assembly_guard::AssemblyTask;
-use crate::utils::core_util::{get_config_to_struct, LogExpectExt};
+use crate::utils::core_util::get_config_to_struct;
 use crate::utils::inner_util::{find_cycle_path, merge_toml_values};
 use crate::{BoxFuture, ComponentProcessorFactory};
 use anyhow::{Context, anyhow};
@@ -16,10 +15,9 @@ use time::UtcOffset;
 use time::macros::format_description;
 use tokio::runtime::Builder;
 use tokio::task::JoinSet;
-use tokio_cron_scheduler::{Job, JobScheduler};
 use tokio_util::sync::CancellationToken;
 use toml::{Value, toml};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling;
 use tracing_subscriber::fmt::time::OffsetTime;
@@ -64,6 +62,44 @@ pub(crate) struct AppConfig {
     profile: Option<String>,
     /// 应用名称，用于日志显示等
     name: Option<String>,
+    /// 应用通用时区：`local`（本机时区，缺省）或 `+HH:MM` / `-HH:MM`
+    timezone: Option<String>,
+    /// 是否安装全局上下文快照（`app_config` / `app_container` 的数据来源），缺省不安装
+    enable_global_snapshot: Option<bool>,
+}
+
+impl AppConfig {
+    /// 是否安装全局上下文快照（缺省不安装）
+    ///
+    /// 快照是依赖注入之外的逃生舱，供无上下文传播的场景（用户自建线程、
+    /// 无法注入的工具函数）只读访问；不需要时保持关闭可省去安装与清空。
+    fn global_snapshot_enabled(&self) -> bool {
+        self.enable_global_snapshot.unwrap_or(false)
+    }
+
+    /// 解析应用通用时区（日志时间戳与定时任务触发计算共用）
+    ///
+    /// `local`（缺省）读取本机时区：读取失败回退 UTC 并返回提示文本，由日志系统就绪后补记；
+    /// 显式 `+HH:MM` / `-HH:MM` 解析失败则报错（启动期 fail-fast）。
+    /// 偏移在启动时解析一次后冻结，运行期不随夏令时变化。
+    fn resolve_offset(&self) -> anyhow::Result<(UtcOffset, Option<String>)> {
+        match self.timezone.as_deref() {
+            None | Some("local") => match UtcOffset::current_local_offset() {
+                Ok(offset) => Ok((offset, None)),
+                Err(e) => Ok((
+                    UtcOffset::UTC,
+                    Some(format!(
+                        "Failed to read local timezone offset ({e}); falling back to UTC"
+                    )),
+                )),
+            },
+            Some(text) => UtcOffset::parse(text, &format_description!("[offset_hour]:[offset_minute]"))
+                .map(|offset| (offset, None))
+                .with_context(|| {
+                    format!("Invalid app.timezone '{text}' (expect \"local\" or \"+HH:MM\")")
+                }),
+        }
+    }
 }
 
 /// 日志配置
@@ -81,8 +117,8 @@ pub(crate) struct LoggerConfig {
     with_thread_id: bool,
     /// 是否在日志中显示线程名称
     with_thread_name: bool,
-    /// 日志时区，默认使用UTC时间
-    timezone: Option<String>,
+    /// 日志时间格式：`simple`（缺省）/ `rfc3339` / `time_only`
+    time_format: Option<String>,
 
     /// 日志文件路径
     log_dir: Option<String>,
@@ -274,47 +310,61 @@ impl Application {
             eprintln!("FATAL: Failed to set global config (already initialized)");
             return;
         }
-        // 配置加载完成：安装全局配置快照（此后任意阶段可经 `app_config` 读取，
-        // 窗口持续至组件销毁完成、关闭流程最后一步清空）
-        install_config_snapshot(self.context.config());
+        // 2. 读取应用基础配置（含通用时区、全局快照开关）
+        let app_config: AppConfig = match get_config_to_struct(self.context.config(), "app") {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("FATAL: Failed to read app config: {:?}", e);
+                return;
+            }
+        };
 
-        // 2. 初始化 Tracing 日志系统
-        if let Err(e) = self.init_tracing() {
+        // 全局快照缺省不安装：需要 `app_config` / `app_container` 时在 `[app]` 显式开启
+        let config_snapshot_installed = app_config.global_snapshot_enabled();
+        if config_snapshot_installed {
+            // 配置加载完成：安装全局配置快照（此后任意阶段可经 `app_config` 读取，
+            // 窗口持续至组件销毁完成、关闭流程最后一步清空）
+            install_config_snapshot(self.context.config());
+        }
+
+        // 3. 初始化 Tracing 日志系统（时间戳时区取自应用通用时区）
+        if let Err(e) = self.init_tracing(&app_config) {
             eprintln!("FATAL: Tracing Init Failed: {:?}", e);
             return;
         }
 
-        // 3. 读取并打印关键配置信息
-        let app_config: AppConfig = get_config_to_struct(self.context.config(), "app")
-            .log_expect("Failed to get app config");
+        // 安装回执须在日志系统就绪后补记：安装点在日志初始化之前，此时尚无订阅者
+        if config_snapshot_installed {
+            info!("Global config snapshot installed: [app_config]");
+        }
+
+        // 4. 打印关键配置信息
         if let Some(ref profile) = app_config.profile {
             info!("Active configuration profile: '{}'", profile);
         } else {
             debug!("Using default configuration (no profile activated)");
         }
 
-        // 4. 初始化 Tokio 运行时
+        // 5. 初始化 Tokio 运行时
         if let Err(e) = self.init_runtime() {
             error!("Failed to initialize tokio runtime: {:?}", e);
             return;
         }
 
-        // 5. 执行启动方法
-        if let Err(e) = self.start() {
+        // 6. 执行启动方法
+        if let Err(e) = self.start(app_config.global_snapshot_enabled()) {
             error!("Failed to start application: {:?}", e);
             // 已创建的资源由 Drop 兑底清理（见 Drop 实现）
             return;
         }
 
-        // 6. 启动运行阶段
+        // 7. 启动运行阶段
         let cancel_token = CancellationToken::new();
         let task_spawns_factory = self.context.take_task_spawns();
         let has_main_loop_hook = self.main_loop_hook.is_some();
         if let Some(main_loop_hook) = self.main_loop_hook.take() {
-            if inventory::iter::<CronJob>.into_iter().next().is_some()
-                || !task_spawns_factory.is_empty()
-            {
-                // 有自定义主循环，并且定时任务或者普通任务工厂不为空，将app核心管理任务作为一个普通的任务提交到运行时中
+            if !task_spawns_factory.is_empty() {
+                // 有自定义主循环，并且后台任务工厂不为空，将app核心管理任务作为一个普通的任务提交到运行时中
                 let handle = self.tokio_runtime.as_ref().unwrap().handle().clone();
                 let token_for_wait = cancel_token.clone();
                 let core_task_handle = handle.spawn(app_core_task_spawn(
@@ -397,7 +447,7 @@ impl Application {
     /// 初始化日志系统
     ///
     /// 构建顺序：基础 Filter → 时间格式与时区 → 内置控制台/文件层 → 用户自定义层。
-    fn init_tracing(&mut self) -> anyhow::Result<()> {
+    fn init_tracing(&mut self, app_config: &AppConfig) -> anyhow::Result<()> {
         let logger_config: LoggerConfig = get_config_to_struct(self.context.config(), "logger")?;
 
         // 1. 基础 Filter, 对所有layer生效
@@ -407,21 +457,28 @@ impl Application {
             .with_default_directive(log_level.into()) // 如果没有 RUST_LOG，就用这个
             .from_env_lossy(); // 尝试读取 RUST_LOG，如果格式不对不报错，而是忽略环境变量
 
-        // 2. 定义时间格式
-        let time_fmt = format_description!(
-            "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]"
-        );
-        // 3. 决定时区
-        let offset = if let Some(tz_str) = &logger_config.timezone {
-            // 如果配置了，尝试解析 "+08:00"
-            UtcOffset::parse(
-                tz_str,
-                &format_description!("[offset_hour]:[offset_minute]"),
-            )
-            .context("Invalid timezone format (expect +HH:MM)")?
-        } else {
-            // 默认使用 UTC, 为了和文件输出时tracing-appender只能按照UTC创建文件匹配
-            UtcOffset::UTC
+        // 2. 决定时区：应用通用时区（日志与定时任务共用；`local` 读取失败回退 UTC）
+        let (offset, offset_fallback) = app_config.resolve_offset()?;
+        if self.context.set_app_offset(offset).is_err() {
+            return Err(anyhow::anyhow!("Application timezone already initialized"));
+        }
+
+        // 3. 确定日志时间格式（三种预设均带 UTC 偏移，使日志行自解释）
+        let time_fmt = match logger_config.time_format.as_deref() {
+            None | Some("simple") => format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6] [offset_hour sign:mandatory]:[offset_minute]"
+            ),
+            Some("rfc3339") => format_description!(
+                "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:6][offset_hour sign:mandatory]:[offset_minute]"
+            ),
+            Some("time_only") => format_description!(
+                "[hour]:[minute]:[second].[subsecond digits:6] [offset_hour sign:mandatory]:[offset_minute]"
+            ),
+            Some(other) => {
+                return Err(anyhow::anyhow!(
+                    "Invalid logger.time_format '{other}' (expect \"simple\", \"rfc3339\" or \"time_only\")"
+                ));
+            }
         };
 
         // 4. 创建 Timer
@@ -491,6 +548,11 @@ impl Application {
             .with(filter_layer)
             .try_init()
             .map_err(|e| anyhow::anyhow!("Failed to init tracing: {:?}", e))?;
+
+        // 时区回退提示（`local` 读取失败时）需要日志系统就绪后才能落盘，故在此补记
+        if let Some(notice) = offset_fallback {
+            warn!("{}", notice);
+        }
 
         //打印日志启动等级
         info!(
@@ -634,7 +696,7 @@ impl Application {
     /// 4. 插件 components_ready：获取组件、注入协作结构
     /// 5. 插件 finalize：消费注册表、构建并启动服务
     /// 6. 启动钩子（接收应用上下文）
-    fn start(&mut self) -> anyhow::Result<()> {
+    fn start(&mut self, enable_global_snapshot: bool) -> anyhow::Result<()> {
         // 1. 插件排序（同步）
         if !self.plugins.is_empty() {
             self.sort_plugins_by_dependency()?;
@@ -679,7 +741,12 @@ impl Application {
                 let config = app
                     .context
                     .config();
-                if let Err(e) = app.context.container().load(config).await {
+                if let Err(e) = app
+                    .context
+                    .container()
+                    .load(config, enable_global_snapshot)
+                    .await
+                {
                     return Err(anyhow!("Component repository load failed: {:?}", e));
                 }
             }
@@ -798,8 +865,8 @@ impl Application {
                     }
                 }
 
-                // 组件销毁完成：清空全局配置快照（关闭流程最后一步，此后
-                // `app_config` 返回 None；此前已持有 Arc clone 者保活可继续使用）
+                // 组件销毁完成：清空全局配置快照（关闭流程最后一步；未安装时为空操作，
+                // 此后 `app_config` 返回 None；此前已持有 Arc clone 者保活可继续使用）
                 clear_config_snapshot();
 
                 info!("Application shutdown completed. Bye!");
@@ -822,28 +889,6 @@ impl Drop for Application {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-/// 创建调度器并加载任务
-async fn create_scheduler() -> anyhow::Result<JobScheduler> {
-    let scheduler = JobScheduler::new().await?;
-
-    for job_desc in inventory::iter::<CronJob> {
-        let name = job_desc.name;
-        let cron_expr = job_desc.cron_expr;
-        let runner = job_desc.runner;
-
-        info!("Scheduling Job: [{}] expr: '{}'", name, cron_expr);
-
-        let job = Job::new_async(cron_expr, move |_uuid, _l| runner())
-            .context(format!("Invalid cron expression for job {}", name))?;
-
-        scheduler.add(job).await?;
-    }
-
-    scheduler.start().await?;
-
-    Ok(scheduler)
 }
 
 /// 监听退出信号
@@ -871,7 +916,7 @@ async fn shutdown_signal() {
     }
 }
 
-/// app核心管理任务，该任务提交注册的定时、普通任务到运行时中，并在收到关闭信号后等待所有异步任务取消完毕
+/// app核心管理任务，该任务提交注册的后台任务到运行时中，并在收到关闭信号后等待所有异步任务取消完毕
 async fn app_core_task_spawn<F>(
     cancel_token: CancellationToken,
     app_config: AppConfig,
@@ -882,20 +927,6 @@ async fn app_core_task_spawn<F>(
 ) where
     F: Future<Output = ()> + Send + 'static,
 {
-    // 如果有定时任务，则创建一个定时任务管理器
-    let mut scheduler = if inventory::iter::<CronJob>.into_iter().next().is_some() {
-        match create_scheduler().await {
-            Ok(scheduler) => Some(scheduler),
-            Err(e) => {
-                // 定时任务创建失败提前结束该任务
-                error!("Failed to create scheduler: {:?}", e);
-                return;
-            }
-        }
-    } else {
-        None
-    };
-
     // 注册上来的普通任务不为空时，提交这些任务到运行时中
     let mut task_set = if !task_spawns_factory.is_empty() {
         let mut set = JoinSet::new();
@@ -922,15 +953,6 @@ async fn app_core_task_spawn<F>(
     // 如果是有自定义主循环，那么取消指令由其发出，上面阻塞会释放，没有时说明是接收退出信号取消，这里在收到退出信号后发出取消信号关闭其他异步任务
     if !has_main_loop_hook {
         cancel_token.cancel();
-    }
-
-    // 关闭定时任务
-    if let Some(mut scheduler) = scheduler.take() {
-        if let Err(e) = scheduler.shutdown().await {
-            error!("Failed to shutdown scheduler: {:?}", e);
-        } else {
-            info!("Scheduler shutdown completed.");
-        }
     }
 
     // 普通任务内部自己处理了取消时机，即监听了取消令牌的取消信号，这里等待所有任务结束

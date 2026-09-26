@@ -1,6 +1,6 @@
 [package]
 name = "simple-starter-core"
-version = "4.1.0"
+version = "4.2.0"
 edition = "2024"
 
 [dependencies]
@@ -13,7 +13,6 @@ toml = { workspace = true }
 serde_json = { workspace = true }
 inventory = { workspace = true }
 tokio = { workspace = true }
-tokio-cron-scheduler = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tokio-util = { workspace = true}

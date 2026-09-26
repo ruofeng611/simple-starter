@@ -9,7 +9,7 @@
 - **智能生命周期管理**：自动计算组件依赖拓扑，按序 create → init，退出时逆序 destroy
 - **条件注册**：`condition = ComponentCondition::on_missing_trait::<dyn T>()` 实现"默认实现 + 用户覆盖"
 - **分布式路由**：Web 路由分散定义，启动时自动收集聚合，无需集中挂载
-- **声明式定时任务**：`#[cron_job]` 直接在函数上定义定时任务
+- **声明式定时任务**：`#[cron_job]` / `#[scheduled]` 声明函数或组件方法为定时任务，触发规则可由配置覆盖（由 `simple-starter-schedule` 插件提供）
 - **分层配置系统**：`application.toml` 与多环境 Profile 自动合并
 - **插件系统**：`assemble` / `components_ready` / `finalize` 三阶段生命周期，装配期经扩展存储解耦协作
 - **事件系统**：Spring 风格事件发布/监听，监听器自动收集、按事件类型分桶分派
@@ -19,10 +19,11 @@
 
 | 模块 | 说明 | 文档 |
 |---|---|---|
-| **simple-starter-core** | 运行时核心：组件模型、依赖注入、插件系统、配置管理、事件系统、任务调度 | [README](./simple-starter-core/README.md) |
+| **simple-starter-core** | 运行时核心：组件模型、依赖注入、插件系统、配置管理、事件系统 | [README](./simple-starter-core/README.md) |
 | **simple-starter-macro** | 过程宏集合：组件注册、依赖注入、路由挂载等声明式注解的代码展开 | [README](./simple-starter-macro/README.md) |
 | **simple-starter-web** | Web 插件：Axum 集成、路由自动收集、统一 JSON 响应、监听器扩展 | [README](./simple-starter-web/README.md) |
 | **simple-starter-security** | 安全插件：编译期资源收集、白名单放行、用户认证与权限校验 | [README](./simple-starter-security/README.md) |
+| **simple-starter-schedule** | 定时任务插件：声明式任务注册、触发规则配置化、关闭收编 | [README](./simple-starter-schedule/README.md) |
 
 ## 模块职责与依赖关系
 
@@ -31,17 +32,18 @@ simple-starter-macro（纯过程宏，不依赖任何模块）
         ↑
 simple-starter-core（运行时引擎，依赖并重导出核心宏）
         ↑
-simple-starter-web（Axum Web 集成，依赖 core + macro）
-        ↑
-simple-starter-security（安全中间件，依赖 core + web）
+        ├── simple-starter-web（Axum Web 集成，依赖 core + macro）
+        ├── simple-starter-security（安全中间件，依赖 core + web）
+        └── simple-starter-schedule（定时任务插件，依赖 core + macro）
 ```
 
 - **simple-starter-core**：框架的核心引擎，不依赖任何业务模块。依赖并重导出核心宏，用户只需依赖 core 即可使用 `#[component]` 等宏。
-- **simple-starter-macro**：纯过程宏 crate，展开代码通过绝对路径（`::simple_starter_core::...`、`::simple_starter_web::...`、`::simple_starter_security::...`）引用运行时，自身零依赖。注意：过程宏 crate 只能导出宏，普通类型由各自模块导出。
+- **simple-starter-macro**：纯过程宏 crate，展开代码通过绝对路径（`::simple_starter_core::...`、`::simple_starter_web::...`、`::simple_starter_schedule::...`）引用运行时，自身零依赖。注意：过程宏 crate 只能导出宏，普通类型由各自模块导出。
 - **simple-starter-web**：依赖 core，重导出 Web 相关宏。
 - **simple-starter-security**：依赖 core + web，重导出安全相关宏。
+- **simple-starter-schedule**：依赖 core，重导出定时任务相关宏（`#[cron_job]` / `#[scheduled]`）。
 
-用户侧依赖规则：使用核心能力（组件、DI、事件、定时任务）只依赖 `simple-starter-core`；使用 Web 路由宏依赖 `simple-starter-web`；使用安全宏依赖 `simple-starter-security`；均无需直接依赖 `simple-starter-macro`。
+用户侧依赖规则：使用核心能力（组件、DI、事件）只依赖 `simple-starter-core`；使用定时任务依赖 `simple-starter-schedule`；使用 Web 路由宏依赖 `simple-starter-web`；使用安全宏依赖 `simple-starter-security`；均无需直接依赖 `simple-starter-macro`。
 
 ## 快速开始
 
@@ -90,5 +92,6 @@ simple-starter/
 ├── simple-starter-macro/     # 过程宏集合
 ├── simple-starter-web/       # Web 插件
 ├── simple-starter-security/  # 安全插件
+├── simple-starter-schedule/  # 定时任务插件
 └── README.md                 # 本文档（模块导航）
 ```

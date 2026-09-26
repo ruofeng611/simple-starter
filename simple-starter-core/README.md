@@ -1,6 +1,6 @@
 # simple-starter-core
 
-`simple-starter-core` 是 simple-starter 框架的**运行时核心**：提供配置管理、组件模型、依赖注入、插件系统、事件系统、任务调度与生命周期管理。web / security 等插件与用户应用都构建在它之上。
+`simple-starter-core` 是 simple-starter 框架的**运行时核心**：提供配置管理、组件模型、依赖注入、插件系统、事件系统与生命周期管理。web / security 等插件与用户应用都构建在它之上。
 
 ## 一、基本原理
 
@@ -115,7 +115,7 @@ fn main() {
 | `get_component_by_trait::<dyn Trait>()` | 按 trait 获取唯一实现 |
 | `get_component_by_trait_and_name::<dyn Trait>("name")` | 按 trait + 名称获取指定实现 |
 | `get_components_by_trait::<dyn Trait>()` | 收集 trait 全部实现 `Vec<Arc<dyn Trait>>` |
-| `app_container()` / `app_config()` | 全局上下文快照读取（无上下文传播场景的只读访问点，详见下文） |
+| `app_container()` / `app_config()` | 全局上下文快照读取（无上下文传播场景的只读访问点，需 `[app] enable_global_snapshot = true`，详见下文） |
 
 #### 全局上下文快照（无上下文传播场景的读取点）
 
@@ -131,6 +131,8 @@ fn main() {
 )]
 ```
 
+- **开关**：缺省**不安装**，配置 `[app] enable_global_snapshot = true` 时才安装；关闭时两个入口恒返回 `None`（框架内部不使用快照，关闭不影响框架运行）
+- **安装回执**：开启时启动日志分别打印 `Global config snapshot installed: [app_config]`（配置加载完成后）与 `Global container snapshot installed: [app_container]`（组件装配完成后）
 - **安装**：两个快照独立安装——配置快照在配置加载完成后（`Application::run` 起始），组件容器快照在 `after_all_ready` 批次后（批次内回调经钩子参数访问容器，不依赖全局快照）
 - **清空**：组件容器快照在 `before_destroy` 批次前清空（批次内同理用钩子参数）；配置快照在组件销毁完成后、关闭流程最后一步清空
 - **合法窗口**：`app_container` 仅运行期可读（`after_all_ready` 批次后至 `before_destroy` 批次前），窗口外返回 `None`；`app_config` 自配置加载完成至组件销毁完成全程可读。窗口外读取返回 `None`；已持有 `Arc` clone 的读者访问到的是已掏空的空壳（查询安全失败，不会悬垂）。注意：快照窗口只约束快照入口本身——容器查询安全窗口更宽（容器冻结起即安全，见第六节），框架主动传入容器引用的时机（钩子参数、`AppContext::container()`）不受快照窗口限制
@@ -147,11 +149,10 @@ fn main() {
 | `#[inject]` | 标记字段/参数注入依赖 |
 | `#[injectable]` | 标记 trait 实现，注册 trait → 实现映射 |
 | `#[lifecycle]` | 标记 `ComponentLifecycle` 实现，注册容器级周期回调（`after_all_ready` / `before_destroy`） |
-| `#[cron_job]` | 声明式定时任务 |
 | `#[event_listener]` | 声明式事件监听器 |
 
 ```rust
-use simple_starter_core::{component, configuration, cron_job, inject, injectable, provider};
+use simple_starter_core::{component, configuration, inject, injectable, provider};
 
 // 配置组件：从 TOML 的 [database] 段反序列化
 #[derive(serde::Deserialize)]
@@ -189,10 +190,6 @@ impl simple_starter_core::ComponentLifecycle for UserService {
         Ok(())
     }
 }
-
-// 定时任务
-#[cron_job("*/5 * * * * *")]
-async fn heartbeat_task() { /* 每 5 秒执行 */ }
 ```
 
 ### 4. Plugin trait（自定义插件）
@@ -280,10 +277,10 @@ impl LoginService {
 
 ## 三、组合使用示例
 
-以下示例串联配置、组件、trait 注入、定时任务与启动钩子：
+以下示例串联配置、组件、trait 注入与启动钩子：
 
 ```rust
-use simple_starter_core::{anyhow, component, configuration, cron_job, inject, injectable, provider};
+use simple_starter_core::{anyhow, component, configuration, inject, injectable, provider};
 use simple_starter_core::Application;
 use std::sync::Arc;
 
@@ -321,10 +318,6 @@ struct ParserService {
 impl ParserService {
     async fn init(&self) -> anyhow::Result<()> { Ok(()) }
 }
-
-// 5. 定时任务
-#[cron_job("0/30 * * * * *")]
-async fn cleanup_task() { /* 每 30 秒清理 */ }
 
 fn main() {
     Application::new()
@@ -438,8 +431,7 @@ graph TD
         CheckMainLoop -- "否 (默认)" --> BlockCore["阻塞等待 App 核心任务"]
 
         subgraph S_CoreTask ["核心任务逻辑"]
-            BlockCore --> SchedCreate[创建并启动 Cron 调度器]
-            SchedCreate --> TaskSpawn[派发注册的异步任务]
+            BlockCore --> TaskSpawn["派发注册的后台任务"]
             TaskSpawn --> WaitSignal[等待退出信号 Ctrl+C / SIGTERM]
         end
 
